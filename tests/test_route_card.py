@@ -17,7 +17,7 @@ else:
 
 @unittest.skipIf(reader is None, "Install scripts/requirements-route-card.txt for the vision tests")
 class RouteCardTests(unittest.TestCase):
-    def test_sketch_code_must_occupy_its_own_footer_cell(self):
+    def test_form_code_must_occupy_its_own_footer_cell(self):
         sheet = reader.Image.new("L", (400, 300), 255)
         draw = reader.ImageDraw.Draw(sheet)
         draw.rectangle((8, 273, 390, 292), outline=0)
@@ -26,19 +26,30 @@ class RouteCardTests(unittest.TestCase):
         code = dict(text="КЭ", x0=26, top=278, x1=44, bottom=289)
         with tempfile.TemporaryDirectory() as out:
             def match(words, ocr=None):
-                return reader.find_sketch_marker(page, sheet, [page.bbox], words, ocr, Path(out))
+                return reader.find_form_marker(page, sheet, [page.bbox], words, ocr, Path(out))
 
             marker, angle = match([code])
             self.assertEqual((marker["code"], marker["method"], angle), ("КЭ", "pdf", 0))
             self.assertTrue((Path(out)/marker["crop"]).is_file())
             self.assertIsNone(match([dict(code, top=100, bottom=110)]))
             self.assertIsNone(match([code, dict(code, text="лист")]))
+            for text, kind in (("МК", "route_card"), ("OK", "operation_card"), ("MK", "route_card")):
+                self.assertEqual(match([dict(code, text=text)])[0]["type"], kind)
+            self.assertIsNone(match([dict(code, text="МК-1")]))
             ocr = Mock()
             ocr.line.return_value = "КЗ"
             ocr.recognize_line.return_value = ("КЗ", 95)
             self.assertIsNone(match([], ocr))
             ocr.recognize_line.return_value = ("КЭ", 34)
             self.assertIsNone(match([], ocr))
+
+    def test_outer_frame_is_not_read_as_the_footer(self):
+        sheet = reader.Image.new("L", (570, 400), 255)
+        draw = reader.ImageDraw.Draw(sheet)
+        draw.rectangle((25, 15, 540, 382), outline=0)
+        draw.rectangle((46, 340, 520, 364), outline=0)
+        draw.line((110, 340, 110, 364), fill=0)
+        self.assertEqual(reader.footer_cell(sheet), (46, 340, 110, 364))
 
     def test_uncertain_scanned_word_requires_matching_confident_retry(self):
         image = reader.Image.new("L", (96, 42), 255)

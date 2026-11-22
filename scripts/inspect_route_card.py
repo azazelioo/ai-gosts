@@ -49,6 +49,13 @@ FIELDS = (
     ("profile_size", "Профиль и размеры", "below"),
 )
 
+FORM_TYPES = {
+    "МК": ("route_card", "Маршрутная карта"),
+    "ОК": ("operation_card", "Операционная карта"),
+    "КЭ": ("sketch_card", "Карта эскизов"),
+}
+LOOKALIKE_LETTERS = str.maketrans("MOK", "МОК")
+
 
 def word_box(w):
     return w["x0"], w["top"], w["x1"], w["bottom"]
@@ -202,37 +209,59 @@ def footer_cell(sheet):
     width, height = sheet.size
     if min(width, height) < 80:
         return None
-    offset = int(height*.80)
+    offset = int(height*.70)
     strip = np.asarray(sheet.crop((0, offset, width, height)).convert("L")) < 190
-    rules = runs(strip[:, width//5:width*4//5].mean(axis=1) > .90)
+    rows = np.flatnonzero(strip[:, width//5:width*4//5].mean(axis=1) > .90)
+    rules = np.split(rows, np.flatnonzero(np.diff(rows) > 1)+1)
     if len(rules) < 2:
         return None
-    top, bottom = rules[-2:]
-    if not 6 < bottom-top < height*.09:
-        return None
-    walls = runs(strip[top+2:bottom-1, :width//3].mean(axis=0) > .90)
-    if len(walls) < 2:
-        return None
-    left, right = walls[:2]
-    if left > width*.12 or not .035*width < right-left < .23*width:
-        return None
-    if min(strip[max(0,y-1):y+2, left:right].any(axis=0).mean() for y in (top,bottom)) < .9:
-        return None
-    return left, top+offset, right, bottom+offset
+    # Some published forms sit inside an additional frame. Its lower margin
+    # has no enclosed code cell; the last row of the form is directly above it.
+    for i in range(len(rules)-1, max(0, len(rules)-3), -1):
+        upper, lower = rules[i-1:i+1]
+        top, bottom = (int((band[0]+band[-1])//2) for band in (upper, lower))
+        if not 6 < bottom-top < height*.09:
+            continue
+        walls = runs(strip[top+2:bottom-1, :width//3].mean(axis=0) > .90)
+        for left, right in zip(walls, walls[1:]):
+            if left > width*.18 or not .035*width < right-left < .23*width:
+                continue
+            if min(strip[max(0,band[0]-1):band[-1]+2, left:right].any(axis=0).mean()
+                   for band in (upper, lower)) >= .9:
+                return left, top+offset, right, bottom+offset
+    return None
 
 
-def is_sketch_code(text):
-    return text.upper().replace("K", "К") == "КЭ"
+def form_code(text):
+    code = text.strip().upper().translate(LOOKALIKE_LETTERS)
+    return code if code in FORM_TYPES else None
 
 
-def find_sketch_marker(page, raster, regions, pdf_words, ocr, dest):
+def has_native_footer_code(page, chars, stream):
+    # PDF drawing order need not include a separator before or after the code.
+    # A candidate only triggers rendering; the complete cell is checked below.
+    ox, oy = page.bbox[:2]
+    for hit in re.finditer(r"(?=(?:М\s*К|О\s*К|К\s*Э))", stream.translate(LOOKALIKE_LETTERS)):
+        char = chars[hit.start()]
+        angle = glyph_rotation(char)
+        if angle is None:
+            continue
+        l,t,r,b = word_box(char)
+        box = rotate_box((l-ox,t-oy,r-ox,b-oy), page.width, page.height, angle)
+        w,h = (page.height,page.width) if angle in (90,270) else (page.width,page.height)
+        if box[0] < .30*w and box[3] > .70*h:
+            return True
+    return False
+
+
+def find_form_marker(page, raster, regions, source_tokens, ocr, dest):
     sx, sy = raster.width/page.width, raster.height/page.height
     ox, oy = page.bbox[:2]
     def raster_box(box):
         l,t,r,b = box
         return round((l-ox)*sx), round((t-oy)*sy), round((r-ox)*sx), round((b-oy)*sy)
 
-    words = [(w["text"], raster_box(word_box(w))) for w in pdf_words]
+    words = [(w["text"], raster_box(word_box(w))) for w in source_tokens if w["text"].strip()]
     for region in regions:
         x,y,r,b = raster_box(region)
         crop = raster.crop((x,y,r,b))
@@ -249,15 +278,15 @@ def find_sketch_marker(page, raster, regions, pdf_words, ocr, dest):
             fragment = sheet.crop((l+3,t+3,right-3,bottom-3)).convert("L")
             method = "pdf"
             if labels:
-                text = " ".join(labels)
-                if not is_sketch_code(text):
+                text = "".join(labels)
+                if not form_code(text):
                     continue
             else:
                 if not ocr or not ocr.ready():
                     continue
                 method = "ocr"
                 text = ocr.line(sheet, cell, scan=True)
-                if not is_sketch_code(text):
+                if not form_code(text):
                     # A two-letter italic form code can look like a different word
                     # before deskewing. Check the entire cell without a whitelist.
                     upright = fragment.transform(fragment.size, Image.Transform.AFFINE,
@@ -266,11 +295,12 @@ def find_sketch_marker(page, raster, regions, pdf_words, ocr, dest):
                     enlarged = upright.resize((round(upright.width*2.3),round(upright.height*1.7)),
                                               Image.Resampling.LANCZOS)
                     text, score = ocr.recognize_line(enlarged)
-                    if score < 65 or not is_sketch_code(text):
+                    if score < 65 or not form_code(text):
                         continue
             filename = f"page-{page.page_number}-form-code.png"
             sheet.crop((cell[0],cell[1],cell[2]+1,cell[3]+1)).save(dest/filename)
-            return {"type": "sketch_card", "code": "КЭ", "text": text, "method": method,
+            code = form_code(text)
+            return {"type": FORM_TYPES[code][0], "code": code, "text": text, "method": method,
                     "crop": filename, "box_pt": [round(v/s,2) for v,s in zip(source,(sx,sy,sx,sy))]}, angle
     return None
 
@@ -436,6 +466,7 @@ def locate(ink, anchor, words, layout, read_marker=None):
 def read_page(page, dest, ocr=None):
     chars = page.chars
     stream = "".join(c["text"] if len(c["text"]) == 1 else "\ufffd" for c in chars)
+    native_footer = bool(chars) and has_native_footer_code(page, chars, stream)
     rotation = form_rotation(chars, stream)
     if rotation:
         chars = rotated_chars(page, rotation)
@@ -466,23 +497,23 @@ def read_page(page, dest, ocr=None):
     result = {"page": page.page_number, "page_size_pt": [page.width, page.height],
               "has_text_layer": bool(page.chars),
               "rotation_clockwise": rotation, "fields": fields}
-    if fields["profile_size"]["method"] == "missing":
-        regions = [word_box(i) for i in images]
-        if any(is_sketch_code(w["text"]) for w in raw_words):
-            regions.append(page.bbox)
-        if regions:
-            if raster is None:
-                raster = page.to_image(resolution=DPI, force_mediabox=True, antialias=True).original
-            marker = find_sketch_marker(page, raster, regions, raw_words, ocr, dest)
-            if marker:
-                result["form"], marker_rotation = marker
-                if not any(box is not None for box, _ in anchors):
-                    result["rotation_clockwise"] = marker_rotation
+    regions = [word_box(i) for i in images]
+    if native_footer:
+        regions.append(page.bbox)
+    if regions:
+        if raster is None:
+            raster = page.to_image(resolution=DPI, force_mediabox=True, antialias=bool(rotation or images)).original
+        marker = find_form_marker(page, raster, regions, page.chars, ocr if images else None, dest)
+        if marker:
+            result["form"], marker_rotation = marker
+            if not any(box is not None for box, _ in anchors):
+                result["rotation_clockwise"] = marker_rotation
+            if result["form"]["code"] == "КЭ" and fields["profile_size"]["method"] == "missing":
                 fields["profile_size"].update(status="not_applicable", method="form_code",
                                               note="Не применимо для карты эскизов (КЭ).")
     if any(box is not None for box, _ in anchors):
-        image = raster if scanned else page.to_image(resolution=DPI, force_mediabox=True,
-                                                     antialias=bool(rotation)).original
+        image = raster if raster is not None else page.to_image(resolution=DPI, force_mediabox=True,
+                                                                antialias=bool(rotation)).original
         source_sx, source_sy = image.width/page.width, image.height/page.height
         sx, sy = source_sx, source_sy
         ox, oy = (0, 0) if scanned else page.bbox[:2]
@@ -582,8 +613,9 @@ def write_report(dest, source, pages):
         if p.get("rotation_clockwise"):
             parts.append(f'<p>Автоповорот по часовой стрелке на {p["rotation_clockwise"]}°.</p>')
         if "form" in p:
-            parts.append(f'<p>Карта эскизов (КЭ)</p><img class="crop" src="{p["form"]["crop"]}" '
-                         'alt="Ячейка с обозначением формы КЭ">')
+            code = p["form"]["code"]
+            parts.append(f'<p>{FORM_TYPES[code][1]} ({code})</p><img class="crop" src="{p["form"]["crop"]}" '
+                         f'alt="Ячейка с обозначением формы {code}">')
         if p.get("ocr_note"):
             parts.append(f'<p>{escape(p["ocr_note"])}</p>')
         if "preview" in p:
@@ -639,7 +671,8 @@ def analyze_document(source, dest, ocr, selection=None, progress=None):
             try:
                 result = read_page(page, dest, ocr)
                 # Full-document review: a page number alone can hide a raster appendix.
-                if selection is None and "preview" not in result and "form" not in result and scan_images(page):
+                if (selection is None and "preview" not in result and
+                        result["fields"]["profile_size"]["status"] != "not_applicable" and scan_images(page)):
                     name = f"page-{n}-review.jpg"
                     thumbnail = page.to_image(resolution=80, antialias=True).original.convert("RGB")
                     thumbnail.thumbnail((1000, 1000))

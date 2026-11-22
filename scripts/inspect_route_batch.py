@@ -11,9 +11,9 @@ from pathlib import Path
 from time import perf_counter
 
 if __package__:
-    from .inspect_route_card import FIELDS, LocalOCR, analyze_document
+    from .inspect_route_card import FIELDS, FORM_TYPES, LocalOCR, analyze_document
 else:
-    from inspect_route_card import FIELDS, LocalOCR, analyze_document
+    from inspect_route_card import FIELDS, FORM_TYPES, LocalOCR, analyze_document
 
 
 def summarize(report):
@@ -25,12 +25,16 @@ def summarize(report):
             "located": sum(f["value"] is not None for f in entries),
             "with_text": sum(bool((f["value"] or {}).get("text")) for f in entries),
         }
+    form_pages = {code: [p["page"] for p in pages if p.get("form", {}).get("code") == code]
+                  for code in FORM_TYPES}
     return {"sha256": report["sha256"], "pages": len(pages), "fields": fields,
+            "form_pages": form_pages,
             "slowest_page": max(({"page": p["page"], "seconds": p["seconds"]} for p in pages),
                                 key=lambda p: p["seconds"], default=None),
             "pages_with_boxes": sum("preview" in page for page in pages),
-            "sketch_card_pages": [page["page"] for page in pages
-                                  if page.get("form", {}).get("type") == "sketch_card"],
+            "sketch_card_pages": form_pages["КЭ"],
+            "profile_not_applicable": [p["page"] for p in pages
+                                       if p["fields"]["profile_size"].get("status") == "not_applicable"],
             "image_review_pages": [page["page"] for page in pages if "review_image" in page],
             "pages_without_text_layer": sum(not page["has_text_layer"] for page in pages)}
 
@@ -40,15 +44,21 @@ def write_summary(dest, documents, seconds):
     for doc in documents:
         name = escape(doc["source"])
         if "error" in doc:
-            cells = f'<td>{name}</td><td colspan="6">{escape(doc["error"])}</td>'
+            cells = f'<td>{name}</td><td colspan="7">{escape(doc["error"])}</td>'
         else:
             cells = (f'<td><a href="{doc["report"]}">{name}</a></td><td>{doc["pages"]}</td>'
                      f'<td>{doc["pages_with_boxes"]}</td>')
+            groups = []
+            for code, numbers in doc["form_pages"].items():
+                if numbers:
+                    links = [f'<a href="{doc["report"]}#page-{n}">{n}</a>' for n in numbers]
+                    groups.append(code + ' · ' + ', '.join(links))
+            cells += '<td>' + ('<br>'.join(groups) or '—') + '</td>'
             for key, _, _ in FIELDS:
                 field = doc["fields"][key]
                 counts = f'{field["with_text"]} / {field["located"]}'
-                if key == "profile_size" and doc["sketch_card_pages"]:
-                    links = [f'<a href="{doc["report"]}#page-{n}">{n}</a>' for n in doc["sketch_card_pages"]]
+                if key == "profile_size" and doc["profile_not_applicable"]:
+                    links = [f'<a href="{doc["report"]}#page-{n}">{n}</a>' for n in doc["profile_not_applicable"]]
                     counts += '<br>Не применимо (КЭ), стр. ' + ', '.join(links)
                 cells += f'<td>{counts}</td>'
             links = [f'<a href="{doc["report"]}#page-{n}">{n}</a>' for n in doc["image_review_pages"]]
@@ -66,7 +76,7 @@ def write_summary(dest, documents, seconds):
             f'<p>Полностью обработано страниц: {pages}. Время обработки: {seconds:.2f} с. '
             f'Ошибок документов: {errors}.</p><p>В столбцах граф показано количество ячеек с извлечённым '
             'текстом и общее количество выделенных ячеек значений. Точность текста требует сверки с вырезкой.</p>'
-            '<table><thead><tr><th>Документ</th><th>Страниц</th><th>Страниц с рамками</th>'
+            '<table><thead><tr><th>Документ</th><th>Страниц</th><th>Страниц с рамками</th><th>Виды карт</th>'
             '<th>Обозначение документа</th><th>Профиль и размеры</th><th>Изображения для просмотра</th>'
             '<th>Самая долгая страница</th><th>Секунды</th></tr></thead>'
             '<tbody>' + ''.join(rows) + '</tbody></table></html>')
