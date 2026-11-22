@@ -3,3 +3,4 @@ numpy>=1.26
 Pillow>=10
 # Outline-only operation rows also require a local rus.traineddata (see CLI --tessdata).
 tesserocr>=2.9,<3
+scipy>=1.11,<2

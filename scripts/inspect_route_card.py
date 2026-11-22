@@ -1,4 +1,4 @@
-"""Locate designation and material-profile fields in ESTD route cards with a PDF text layer.
+"""Locate designation and material-profile fields in digital and scanned ESTD route cards.
 
 Run: python scripts/inspect_route_card.py input.pdf --pages 11 22 --output result
 Install scripts/requirements-route-card.txt. For outlined text install rus.traineddata
@@ -12,13 +12,14 @@ import os
 import re
 import sys
 from contextlib import ExitStack
+from difflib import SequenceMatcher
 from html import escape
 from pathlib import Path
 from time import perf_counter
 
 import numpy as np
 import pdfplumber
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 
 LABEL = "Обозначение документа"
@@ -102,9 +103,9 @@ class LocalOCR:
         self.engine = None
         self.unavailable = False
 
-    def line(self, image, box):
+    def ready(self):
         if self.unavailable:
-            return ""
+            return False
         if self.engine is None:
             try:
                 from tesserocr import PyTessBaseAPI, PSM
@@ -112,14 +113,101 @@ class LocalOCR:
                     PyTessBaseAPI(path=str(self.path), lang="rus", psm=PSM.SINGLE_LINE))
             except (ImportError, RuntimeError, OSError):
                 self.unavailable = True
-                return ""
+                return False
+        return True
+
+    def recognize_line(self, fragment):
+        self.engine.SetImage(ImageOps.expand(fragment, border=12, fill="white"))
+        return " ".join(self.engine.GetUTF8Text().split()), self.engine.MeanTextConf()
+
+    def line(self, image, box, scan=False):
+        if not self.ready():
+            return ""
         l,t,r,b = box
         if r-l <= 6 or b-t <= 6:
             return ""
         fragment = image.crop((l+3, t+3, r-3, b-3))
-        self.engine.SetImage(ImageOps.expand(fragment, border=12, fill="white"))
-        line = " ".join(self.engine.GetUTF8Text().split())
-        return line if self.engine.MeanTextConf() >= 65 else ""
+        text, score = self.recognize_line(fragment)
+        if scan and score < 90 and sum(c.isalpha() for c in text) >= 2 and not any(c.isdigit() for c in text):
+            alternative, confidence = self.recognize_line(engineering_text(fragment))
+            if confidence > score:
+                text, score = alternative, confidence
+        return text if score >= 65 else ""
+
+    def scan_lines(self, image):
+        from tesserocr import PSM, RIL, iterate_level
+        self.engine.SetPageSegMode(PSM.SPARSE_TEXT)
+        try:
+            self.engine.SetImage(image)
+            self.engine.Recognize()
+            it = self.engine.GetIterator()
+            return [(item.GetUTF8Text(RIL.TEXTLINE).strip(), item.BoundingBox(RIL.TEXTLINE))
+                    for item in iterate_level(it, RIL.TEXTLINE) if not item.Empty(RIL.TEXTLINE)]
+        finally:
+            self.engine.SetPageSegMode(PSM.SINGLE_LINE)
+
+
+def engineering_text(fragment):
+    """Open cramped gaps after isolated baseline dots, then straighten condensed italic lettering."""
+    from scipy.ndimage import find_objects, label
+    gray = fragment.convert("L")
+    ink = np.asarray(gray) < 160
+    ys = np.flatnonzero(ink.any(axis=1))
+    if not len(ys):
+        return gray
+    height = int(ys[-1] - ys[0] + 1)
+    dots = []
+    for y, x in find_objects(label(ink, structure=np.ones((3, 3), dtype=bool))[0]):
+        if (x.stop-x.start <= max(2, height*.16) and y.stop-y.start <= max(2, height*.16)
+                and ys[0]+.65*height <= y.stop <= ys[-1]+1 and x.stop < gray.width-1
+                and not ink[:, x.stop].any()):
+            dots.append(x.stop)
+    gap = max(2, round(height / 3))
+    for cut in sorted(set(dots), reverse=True):
+        wider = Image.new("L", (gray.width+gap, gray.height), 255)
+        wider.paste(gray.crop((0, 0, cut, gray.height)))
+        wider.paste(gray.crop((cut, 0, gray.width, gray.height)), (cut+gap, 0))
+        gray = wider
+    gray = ImageOps.expand(gray, border=5, fill=255)
+    gray = gray.transform(gray.size, Image.Transform.AFFINE, (1,-.32,.32*gray.height,0,1,0),
+                          Image.Resampling.BICUBIC, fillcolor=255)
+    return gray.resize((round(gray.width*3.3), gray.height*2),
+                       Image.Resampling.LANCZOS).filter(ImageFilter.MinFilter(3))
+
+
+def scan_images(page):
+    if sum(len(c["text"].strip()) for c in page.chars) > 40:
+        return []
+    return [i for i in page.images if i["width"]*i["height"] >= .20*page.width*page.height]
+
+
+def scan_headings(page, source, images, ocr):
+    """Return heading anchors in rotated full-page points, keeping the source PDF untouched."""
+    sx, sy = source.width/page.width, source.height/page.height
+    ox, oy = page.bbox[:2]
+    for obj in images:
+        box = tuple(round(v*s) for v, s in zip((obj["x0"]-ox,obj["top"]-oy,obj["x1"]-ox,obj["bottom"]-oy),
+                                               (sx, sy, sx, sy)))
+        crop = source.crop(box).convert("L")
+        for angle in ((90, 270, 0, 180) if crop.height > crop.width else (0, 180, 90, 270)):
+            rotated = crop.rotate(-angle, expand=True) if angle else crop
+            lines = ocr.scan_lines(rotated)
+            left,top,_,_ = rotate_box(box, source.width, source.height, angle)
+            scale_x,scale_y = (sy,sx) if angle in (90,270) else (sx,sy)
+            anchors = []
+            for _, name, _ in FIELDS:
+                hits = [bounds for line,bounds in lines if SequenceMatcher(
+                    None, line.casefold(), name.casefold()).ratio() >= .89]
+                if len(hits) == 1:
+                    l,t,r,b = hits[0]
+                    anchors.append((((left+l)/scale_x,(top+t)/scale_y,
+                                     (left+r)/scale_x,(top+b)/scale_y), "scan_ocr"))
+                else:
+                    anchors.append((None, "ambiguous" if hits else "missing"))
+            if any(box is not None for box, _ in anchors):
+                evidence = [(line, left+l, top+t, left+r, top+b) for line,(l,t,r,b) in lines]
+                return angle, anchors, evidence
+    return None
 
 
 def symbol_profile(chars):
@@ -265,6 +353,18 @@ def read_page(page, dest, ocr=None):
     for w in raw_words:
         by_text.setdefault(w["text"].casefold(), []).append(w)
     anchors = [find_anchor(chars, stream, by_text, label) for _, label, _ in FIELDS]
+    raster = None
+    scanned = False
+    scan_words = []
+    if ocr and not any(box is not None for box, _ in anchors):
+        images = scan_images(page)
+        if images and ocr.ready():
+            raster = page.to_image(resolution=DPI, force_mediabox=True, antialias=True).original
+            match = scan_headings(page, raster, images, ocr)
+            if match:
+                rotation, anchors, scan_words = match
+                scanned = True
+                raw_words, chars = [], []
     fields = {}
     for (key, label, _), (_, method) in zip(FIELDS, anchors):
         fields[key] = {"label": label, "method": method, "status": "review", "header": None,
@@ -273,10 +373,11 @@ def read_page(page, dest, ocr=None):
               "has_text_layer": bool(page.chars),
               "rotation_clockwise": rotation, "fields": fields}
     if any(box is not None for box, _ in anchors):
-        image = page.to_image(resolution=DPI, force_mediabox=True, antialias=bool(rotation)).original
+        image = raster if scanned else page.to_image(resolution=DPI, force_mediabox=True,
+                                                     antialias=bool(rotation)).original
         source_sx, source_sy = image.width/page.width, image.height/page.height
         sx, sy = source_sx, source_sy
-        ox, oy = page.bbox[:2]
+        ox, oy = (0, 0) if scanned else page.bbox[:2]
         if rotation:
             transpose = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180,
                          270: Image.Transpose.ROTATE_90}
@@ -290,7 +391,7 @@ def read_page(page, dest, ocr=None):
             return round((l-ox)*sx), round((t-oy)*sy), round((r-ox)*sx), round((b-oy)*sy)
 
         words = [(w["text"], *pixels(word_box(w))) for w in raw_words]
-        ink = np.asarray(image.convert("L")) < 150
+        ink = np.asarray(image.convert("L")) < (205 if scanned else 150)
 
         def region(box, kind):
             l,t,r,b = box
@@ -312,7 +413,7 @@ def read_page(page, dest, ocr=None):
                 if value:
                     cell.update(text=value, text_method="pdf_symbol")
             if kind in ("row-a", "profile_size-value") and not cell["text"] and ocr:
-                value = ocr.line(image, box)
+                value = ocr.line(image, box, scan=scanned)
                 if value:
                     cell.update(text=value, text_method="ocr")
             return cell
@@ -332,18 +433,21 @@ def read_page(page, dest, ocr=None):
                     return True
                 return False
 
-            header, value, note = locate(ink, pixels(box), words, layout, read_marker if ocr else None)
+            header, value, note = locate(ink, pixels(box), scan_words if scanned else words,
+                                         layout, read_marker if ocr else None)
             entry["note"] = note
             if header:
                 entry["header"] = region(header, "header" if key == "designation" else key+"-header")
+                if scanned:
+                    heading_box = pixels(box)
+                    entry["header"].update(text=next(w[0] for w in scan_words
+                                                     if w[1:] == heading_box), text_method="ocr")
                 entry["status"] = "header_only"
                 outlines.append((header, HEADER))
             if value:
                 entry["value"] = region(value, "row-a" if key == "designation" else key+"-value")
                 entry["status"] = "located"
                 outlines.append((value, VALUE))
-        if ocr and ocr.unavailable:
-            result["ocr_note"] = "Локальный OCR недоступен. Проверьте tesserocr и каталог rus.traineddata."
         if outlines:
             draw = ImageDraw.Draw(image)
             for box, color in outlines:
@@ -351,6 +455,8 @@ def read_page(page, dest, ocr=None):
             image.thumbnail((1650, 1650))
             result["preview"] = f"page-{page.page_number}.png"
             image.save(dest / result["preview"], compress_level=2)
+    if ocr and ocr.unavailable:
+        result["ocr_note"] = "Локальный OCR недоступен. Проверьте tesserocr и каталог rus.traineddata."
     # Preserve the original designation-field contract for earlier consumers.
     primary = fields["designation"]
     result.update(status=primary["status"], note=primary["note"], header=primary["header"],
@@ -381,6 +487,8 @@ def write_report(dest, source, pages):
                 parts.append(f'<p>Строка {escape(field["row_label"])}</p>')
             if field["method"] == "pdf_stream":
                 parts.append("<p>Название восстановлено по порядку символов PDF. Ниже сохранён исходный текст слоя.</p>")
+            elif field["method"] == "scan_ocr":
+                parts.append("<p>Заголовок найден локальным OCR на изображении таблицы.</p>")
             for key, title in [("header", "Синий контур · заголовок"), ("value", "Оранжевый контур · значение")]:
                 cell = field[key]
                 if cell:
@@ -420,9 +528,7 @@ def analyze_document(source, dest, ocr, selection=None, progress=None):
             try:
                 result = read_page(page, dest, ocr)
                 # Full-document review: a page number alone can hide a raster appendix.
-                if (selection is None and "preview" not in result and
-                        sum(len(c["text"].strip()) for c in page.chars) <= 40 and
-                        any(i["width"]*i["height"] >= .20*page.width*page.height for i in page.images)):
+                if selection is None and "preview" not in result and scan_images(page):
                     name = f"page-{n}-review.jpg"
                     thumbnail = page.to_image(resolution=80, antialias=True).original.convert("RGB")
                     thumbnail.thumbnail((1000, 1000))

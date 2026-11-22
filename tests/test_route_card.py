@@ -17,6 +17,19 @@ else:
 
 @unittest.skipIf(reader is None, "Install scripts/requirements-route-card.txt for the vision tests")
 class RouteCardTests(unittest.TestCase):
+    def test_rotated_scan_finds_unique_heading_in_offset_image(self):
+        page = Mock(width=200, height=120, bbox=(10,20,210,140))
+        image = reader.Image.new("L", (400,240), 255)
+        obj = {"x0": 30, "top": 30, "x1": 80, "bottom": 130}
+        ocr = Mock()
+        ocr.scan_lines.return_value = [("Лрофиль и размеры", (40,10,120,30))]
+        angle, anchors, evidence = reader.scan_headings(page, image, [obj], ocr)
+        self.assertEqual(angle, 90)
+        self.assertEqual(anchors[1], ((30,25,70,35), "scan_ocr"))
+        self.assertEqual(evidence[0][1:], (60,50,140,70))
+        ocr.scan_lines.return_value *= 2
+        self.assertIsNone(reader.scan_headings(page, image, [obj], ocr))
+
     def test_batch_continues_after_error_and_keeps_duplicate_names_separate(self):
         field = {"value": {"text": ""}}
         result = {"sha256": "example", "pages": [{
