@@ -130,6 +130,22 @@ class LocalOCR:
         text, score = self.recognize_line(fragment)
         if scan and score < 90 and sum(c.isalpha() for c in text) >= 2 and not any(c.isdigit() for c in text):
             alternative, confidence = self.recognize_line(engineering_text(fragment))
+            if text == alternative and text.isalpha() and max(score, confidence) < 65:
+                # Retry a consistently read but uncertain word at a larger scale.
+                # A different spelling cannot override the two earlier readings.
+                gray = fragment.convert("L")
+                bounds = gray.point(lambda p: 255 if p < 160 else 0).getbbox()
+                if bounds:
+                    word = ImageOps.expand(gray.crop(bounds), border=4, fill=255)
+                    for slope in (.20, .28):
+                        straight = word.transform(word.size, Image.Transform.AFFINE,
+                                                  (1, -slope, slope*word.height/2, 0, 1, 0),
+                                                  Image.Resampling.BICUBIC, fillcolor=255)
+                        enlarged = straight.resize((int(word.width*1.6), int(word.height*1.6)),
+                                                   Image.Resampling.LANCZOS)
+                        confirmed, rating = self.recognize_line(enlarged)
+                        if confirmed == text and rating >= 65:
+                            return text
             if confidence > score:
                 text, score = alternative, confidence
         return text if score >= 65 else ""

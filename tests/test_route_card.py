@@ -17,6 +17,21 @@ else:
 
 @unittest.skipIf(reader is None, "Install scripts/requirements-route-card.txt for the vision tests")
 class RouteCardTests(unittest.TestCase):
+    def test_uncertain_scanned_word_requires_matching_confident_retry(self):
+        image = reader.Image.new("L", (96, 42), 255)
+        reader.ImageDraw.Draw(image).text((14, 12), "word", fill=0)
+        ocr = reader.LocalOCR(None, None)
+        ocr.engine = Mock()
+        first_passes = [("прокат", 34), ("прокат", 48)]
+        cases = [
+            ([("другое", 95), ("прокат", 76)], "прокат"),
+            ([("другое", 95), ("прокат", 60)], ""),
+        ]
+        for retries, expected in cases:
+            ocr.recognize_line = Mock(side_effect=first_passes + retries)
+            with patch.object(reader, "engineering_text", return_value=image):
+                self.assertEqual(ocr.line(image, (0, 0, 96, 42), scan=True), expected)
+
     def test_rotated_scan_finds_unique_heading_in_offset_image(self):
         page = Mock(width=200, height=120, bbox=(10,20,210,140))
         image = reader.Image.new("L", (400,240), 255)
