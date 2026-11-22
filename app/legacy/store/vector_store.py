@@ -1,15 +1,16 @@
 # vector_store.py
 from chromadb import PersistentClient
+from chromadb.config import Settings
 from typing import List, TYPE_CHECKING
 import hashlib
 
 if TYPE_CHECKING:
-    from llm import MistralLLM
+    from app.legacy.core.llm import LocalLLM
 
 
 class VectorStore:
-    def __init__(self, llm_client: "MistralLLM", persist_directory: str = "./chroma_db"):
-        self.client = PersistentClient(path=persist_directory)
+    def __init__(self, llm_client: "LocalLLM", persist_directory: str = "./chroma_db"):
+        self.client = PersistentClient(path=persist_directory, settings=Settings(anonymized_telemetry=False))
         self.collection = None
         self.llm = llm_client
 

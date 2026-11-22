@@ -2,8 +2,14 @@ import json
 import os
 from typing import Optional
 from urllib import error, request
+from urllib.parse import urlsplit
 
 from app.llm.base import LLMProvider
+
+
+class _NoRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class LocalChatProvider(LLMProvider):
@@ -19,10 +25,26 @@ class LocalChatProvider(LLMProvider):
         if self.backend != "ollama":
             raise ValueError("Unsupported LOCAL_CHAT_BACKEND. Use 'ollama'.")
 
-        self.base_url = (base_url or os.getenv("LOCAL_CHAT_BASE_URL") or "http://ollama:11434").rstrip("/")
-        self.model = (model or os.getenv("LOCAL_CHAT_MODEL") or "qwen2.5:3b").strip()
+        self.base_url = (base_url or os.getenv("LOCAL_CHAT_BASE_URL") or "http://127.0.0.1:11434").rstrip("/")
+        endpoint = urlsplit(self.base_url)
+        loopback_hosts = {"127.0.0.1": "127.0.0.1", "localhost": "127.0.0.1", "::1": "[::1]"}
+        host = loopback_hosts.get(endpoint.hostname)
+        if (
+            endpoint.scheme != "http"
+            or host is None
+            or endpoint.username is not None
+            or endpoint.password is not None
+            or endpoint.path or endpoint.query or endpoint.fragment
+        ):
+            raise ValueError("LOCAL_CHAT_BASE_URL must be an HTTP loopback address.")
+        self.base_url = f"http://{host}:{endpoint.port or 80}"
+        self._opener = request.build_opener(request.ProxyHandler({}), _NoRedirect())
+        self.model = (model or os.getenv("LOCAL_CHAT_MODEL") or "qwen2.5:1.5b").strip()
         if not self.model:
             raise ValueError("LOCAL_CHAT_MODEL must not be empty")
+
+        if self.model.lower().endswith((":cloud", "-cloud")):
+            raise ValueError("Ollama cloud models are disabled.")
 
         raw_temperature = temperature
         if raw_temperature is None:
@@ -40,13 +62,35 @@ class LocalChatProvider(LLMProvider):
         if self.system_prompt:
             payload["system"] = self.system_prompt
 
+        self._check_local_model()
         response = self._post_json("/api/generate", payload)
         text = str(response.get("response") or "").strip()
         if not text:
             raise ValueError(f"Local chat response is invalid: {response}")
         return text
 
-    def _post_json(self, path: str, payload: dict) -> dict:
+    def _check_local_model(self) -> None:
+        info = self._post_json("/api/show", {"model": self.model})
+        if info.get("remote_model") or info.get("remote_host") or not info.get("details", {}).get("format"):
+            raise ValueError("Ollama must use a model with weights installed locally.")
+
+    def chat_messages(self, messages: list[dict], max_tokens: Optional[int] = None):
+        """Yield text from the local chat endpoint, preserving message roles."""
+        self._check_local_model()
+        options = {"temperature": self.temperature}
+        if max_tokens is not None:
+            options["num_predict"] = max_tokens
+        payload = {"model": self.model, "messages": messages, "options": options, "stream": True}
+        with self._open_request("/api/chat", payload) as response:
+            for line in response:
+                chunk = json.loads(line)
+                if "error" in chunk:
+                    raise ValueError(chunk["error"])
+                text = chunk.get("message", {}).get("content")
+                if text:
+                    yield text
+
+    def _open_request(self, path: str, payload: dict):
         body = json.dumps(payload).encode("utf-8")
         req = request.Request(
             url=f"{self.base_url}{path}",
@@ -58,8 +102,7 @@ class LocalChatProvider(LLMProvider):
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=120) as response:
-                raw = response.read().decode("utf-8")
+            return self._opener.open(req, timeout=120)
         except error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
             raise ValueError(f"Local chat request failed: {exc.code} {raw}") from exc
@@ -69,6 +112,9 @@ class LocalChatProvider(LLMProvider):
                 f"Details: {exc.reason}"
             ) from exc
 
+    def _post_json(self, path: str, payload: dict) -> dict:
+        with self._open_request(path, payload) as response:
+            raw = response.read().decode("utf-8")
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:

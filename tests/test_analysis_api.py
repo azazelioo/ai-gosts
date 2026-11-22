@@ -92,12 +92,24 @@ class AnalyzeFileApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
+        self.assertEqual(payload['runtime_modes'], {'chat_mode': 'local', 'embed_mode': 'local'})
         self.assertEqual(payload['document_id'], 'api_doc_1')
         self.assertEqual(payload['standard_id'], 'gost_7_32_2017')
         self.assertIn('rag_agent', payload['agents_run'])
         self.assertGreaterEqual(payload['summary']['total_issues'], 1)
         subtypes = [issue['subtype'] for issue in payload['issues']]
         self.assertIn('heading_trailing_period', subtypes)
+
+    def test_analyze_file_rejects_external_modes(self) -> None:
+        for field in ("chat_mode", "embed_mode"):
+            with self.subTest(field=field):
+                response = self.client.post(
+                    "/analyze-file",
+                    files={"document": ("report.txt", b"test", "text/plain")},
+                    data={"standard_id": "gost_7_32_2017", field: "api"},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(field, response.json()["detail"])
 
     def test_analyze_file_endpoint_can_return_parsed_document(self) -> None:
         text = '1 Введение\n\nРисунок 1 - Архитектура системы\n\n6 Список использованных источников\n\n[1] ГОСТ 7.32-2017'

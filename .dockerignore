@@ -13,3 +13,5 @@ tests
 scripts
 README.md
 LICENSE
+/models/
+.env

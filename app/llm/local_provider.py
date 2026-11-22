@@ -82,7 +82,7 @@ class LocalProvider(LLMProvider, EmbeddingProvider):
     def _load_sentence_transformer(self) -> None:
         from sentence_transformers import SentenceTransformer
 
-        init_kwargs = {}
+        init_kwargs = {"local_files_only": True}
         if self.device:
             init_kwargs["device"] = self.device
         self._encoder = SentenceTransformer(self.model_name, **init_kwargs)
@@ -90,7 +90,12 @@ class LocalProvider(LLMProvider, EmbeddingProvider):
     def _load_fastembed(self) -> None:
         from fastembed import TextEmbedding
 
-        self._encoder = _FastEmbedAdapter(TextEmbedding(model_name=self.model_name))
+        model = TextEmbedding(
+            model_name=self.model_name,
+            cache_dir=os.getenv("FASTEMBED_CACHE_PATH"),
+            local_files_only=True,
+        )
+        self._encoder = _FastEmbedAdapter(model)
 
     def _hash_embed(self, text: str) -> List[float]:
         features = self._tokenize(text)

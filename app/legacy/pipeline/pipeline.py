@@ -5,12 +5,12 @@ from store.graph import KnowledgeGraph
 from store.vector_store import VectorStore
 from store.engine import GraphRAGEngine
 from core.parsers import simple_text_parser
-from core.llm import MistralLLM
+from app.legacy.core.llm import LocalLLM
 import os
 
 
 class DocumentPipeline:
-    def __init__(self, llm: MistralLLM):
+    def __init__(self, llm: LocalLLM):
         self.llm = llm
         self.rag_engine = None
         self.kg = None

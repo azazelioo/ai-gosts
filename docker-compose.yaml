@@ -2,26 +2,37 @@ services:
   app:
     build: .
     container_name: document-formatter-app
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: "service:ollama"
+    environment:
+      LOCAL_CHAT_MODEL: ${LOCAL_CHAT_MODEL:-qwen2.5:1.5b}
+      LOCAL_CHAT_TEMPERATURE: ${LOCAL_CHAT_TEMPERATURE:-0.2}
+      LOCAL_EMBEDDING_MODEL: ${LOCAL_EMBEDDING_MODEL:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
+      FASTEMBED_CACHE_PATH: /models/fastembed
+      HF_HUB_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      ANONYMIZED_TELEMETRY: "False"
     volumes:
       - ./app/storage:/app/app/storage
+      - ${FASTEMBED_CACHE_PATH:-./models/fastembed}:/models/fastembed
+    depends_on:
+      - ollama
     restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
-    profiles:
-      - local-chat
     container_name: document-formatter-ollama
     ports:
-      - "11434:11434"
+      - "127.0.0.1:8000:8000"
+    environment:
+      OLLAMA_HOST: "127.0.0.1:11434"
+      OLLAMA_NO_CLOUD: "1"
     volumes:
       - ollama:/root/.ollama
     restart: unless-stopped
+
+networks:
+  default:
+    internal: true
 
 volumes:
   ollama:

@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, TYPE_
 
 try:
     from chromadb import PersistentClient
+    from chromadb.config import Settings
 except ImportError:  # pragma: no cover - environment fallback
     PersistentClient = None
 
@@ -566,7 +567,7 @@ class VectorIndex:
             self.collection = _InMemoryCollection()
             return
 
-        self.client = PersistentClient(path=persist_directory)
+        self.client = PersistentClient(path=persist_directory, settings=Settings(anonymized_telemetry=False))
         if reset_collection:
             try:
                 self.client.delete_collection(name=collection_name)

@@ -1,31 +1,26 @@
-import os
 import hashlib
 from typing import List, Optional
-from mistralai import Mistral
+from app.llm.local_chat_provider import LocalChatProvider
+from app.llm.local_provider import LocalProvider
 import chromadb
+from chromadb.config import Settings
 
 
 class Agent:
     def __init__(
             self,
-            api_key: Optional[str] = None,
-            model: str = "mistral-small-latest",
-            embedding_model: str = "mistral-embed",
+            model: Optional[str] = None,
+            embedding_model: Optional[str] = None,
             persist_directory: str = "./db_storage"
     ):
         """
         Initialize the RAG Agent.
         """
-        self.api_key = api_key or os.getenv("MISTRAL_API_KEY")
-        if not self.api_key:
-            raise ValueError("MISTRAL_API_KEY not found.")
-
-        self.client = Mistral(api_key=self.api_key)
-        self.model = model
-        self.embedding_model = embedding_model
+        self.chat_provider = LocalChatProvider(model=model)
+        self.embedding_provider = LocalProvider(model_name=embedding_model)
 
         # Initialize ChromaDB (Persistent)
-        self.chroma_client = chromadb.PersistentClient(path=persist_directory)
+        self.chroma_client = chromadb.PersistentClient(path=persist_directory, settings=Settings(anonymized_telemetry=False))
         self.collection = self.chroma_client.get_or_create_collection(name="rag_collection")
 
     def _chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
@@ -47,12 +42,7 @@ class Agent:
         return chunks
 
     def _get_embedding(self, text: str) -> List[float]:
-        """Generate embedding vector using Mistral API."""
-        response = self.client.embeddings.create(
-            model=self.embedding_model,
-            inputs=[text]
-        )
-        return response.data[0].embedding
+        return self.embedding_provider.embed(text)
 
     def ingest_documents(self, documents: List[dict]):
         """
@@ -131,13 +121,5 @@ class Agent:
 
         user_prompt = f"Context:\n{context_text}\n\nQuestion: {question}"
 
-        # 5. Generate Answer using Mistral Chat
-        response = self.client.chat.complete(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ]
-        )
-
-        return response.choices[0].message.content
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        return "".join(self.chat_provider.chat_messages(messages))

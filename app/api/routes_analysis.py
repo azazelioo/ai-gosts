@@ -5,7 +5,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from app.api.dependencies import build_pipeline, get_pipeline, resolve_runtime_modes
+from app.api.dependencies import get_pipeline, resolve_runtime_modes
 from app.fixing.docx_editor import apply_fixes_to_source_docx
 from app.fixing.document_fixer import apply_fixes, build_corrected_docx
 from app.parsing.document_parser import extract_text, extract_text_from_docx, extract_text_from_pdf, extract_text_from_txt
@@ -88,7 +88,7 @@ async def analyze_uploaded_file(
 ):
     try:
         resolved_chat_mode, resolved_embed_mode = resolve_runtime_modes(chat_mode, embed_mode)
-        pipeline = build_pipeline(chat_mode=chat_mode, embed_mode=embed_mode)
+        pipeline = get_pipeline()
         filename = document.filename or 'uploaded_document'
         content = await document.read()
         ext = filename.lower().split('.')[-1] if '.' in filename else ''
@@ -143,8 +143,8 @@ async def analyze_uploaded_file(
 
         result = pipeline.analyze_document(parsed_document)
         runtime_modes = {
-            'chat_mode': resolved_chat_mode or 'default',
-            'embed_mode': resolved_embed_mode or 'default',
+            'chat_mode': resolved_chat_mode,
+            'embed_mode': resolved_embed_mode,
         }
         if include_parsed_document:
             payload = result.model_dump()

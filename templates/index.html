@@ -256,26 +256,6 @@
             flex-wrap: wrap;
         }
 
-        .mode-grid {
-            display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 12px;
-        }
-
-        .switch-card {
-            padding: 14px;
-            border-radius: 18px;
-            border: 1px solid var(--line);
-            background: rgba(255, 255, 255, 0.72);
-            display: grid;
-            gap: 8px;
-        }
-
-        .switch-card small {
-            color: var(--muted);
-            line-height: 1.4;
-        }
-
         button {
             font: inherit;
         }
@@ -508,7 +488,7 @@
             <div class="metrics">
                 <div class="metric">
                     <span class="metric-label">Режим</span>
-                    <span class="metric-value" id="hero-mode">chat {{ chat_mode_default }} / embed {{ embed_mode_default }}</span>
+                    <span class="metric-value">Локально</span>
                 </div>
                 <div class="metric">
                     <span class="metric-label">Стандартов</span>
@@ -554,25 +534,6 @@
                 <label for="document-id">Идентификатор документа</label>
                 <input id="document-id" type="text" placeholder="Например, report_001">
 
-                <div class="mode-grid">
-                    <div class="switch-card">
-                        <label for="chat-mode-select">Чат-модель</label>
-                        <select id="chat-mode-select">
-                            <option value="api" {% if chat_mode_default == 'api' %}selected{% endif %}>API</option>
-                            <option value="local" {% if chat_mode_default == 'local' %}selected{% endif %}>Local</option>
-                        </select>
-                        <small>Используется для стилистического анализа и chat-задач.</small>
-                    </div>
-                    <div class="switch-card">
-                        <label for="embed-mode-select">Embedding-модель</label>
-                        <select id="embed-mode-select">
-                            <option value="api" {% if embed_mode_default == 'api' %}selected{% endif %}>API</option>
-                            <option value="local" {% if embed_mode_default == 'local' %}selected{% endif %}>Local</option>
-                        </select>
-                        <small>Используется для retrieval и graph-RAG.</small>
-                    </div>
-                </div>
-
                 <div class="actions">
                     <button class="btn-primary" id="run-button" type="button">Запустить проверку</button>
                 </div>
@@ -612,8 +573,6 @@
         fixabilityView: 'all',
         dismissedIssueIds: new Set(),
         showDismissed: false,
-        chatMode: '{{ chat_mode_default }}',
-        embedMode: '{{ embed_mode_default }}',
     };
 
     const elements = {
@@ -621,8 +580,6 @@
         documentName: document.getElementById('document-name'),
         standardSelect: document.getElementById('standard-select'),
         documentId: document.getElementById('document-id'),
-        chatModeSelect: document.getElementById('chat-mode-select'),
-        embedModeSelect: document.getElementById('embed-mode-select'),
         runButton: document.getElementById('run-button'),
         downloadFixedButton: document.getElementById('download-fixed-button'),
         statusStrip: document.getElementById('status-strip'),
@@ -635,7 +592,6 @@
         emptyState: document.getElementById('empty-state'),
         heroStandards: document.getElementById('hero-standards'),
         heroStatus: document.getElementById('hero-status'),
-        heroMode: document.getElementById('hero-mode'),
     };
 
     const TYPE_LABELS = {
@@ -649,21 +605,12 @@
     elements.documentInput.addEventListener('change', onDocumentSelected);
     elements.runButton.addEventListener('click', analyzeFile);
     elements.downloadFixedButton?.addEventListener('click', downloadFixedDocument);
-    elements.chatModeSelect?.addEventListener('change', syncModeState);
-    elements.embedModeSelect?.addEventListener('change', syncModeState);
 
     bootstrap();
 
     async function bootstrap() {
-        syncModeState();
         await loadStandards();
         setStatus('Готово к запуску проверки.', 'idle');
-    }
-
-    function syncModeState() {
-        state.chatMode = elements.chatModeSelect?.value || 'default';
-        state.embedMode = elements.embedModeSelect?.value || 'default';
-        elements.heroMode.textContent = `chat ${state.chatMode} / embed ${state.embedMode}`;
     }
 
     async function loadStandards() {
@@ -701,7 +648,6 @@
     }
 
     async function analyzeFile() {
-        syncModeState();
         if (!state.documentFile) {
             setStatus('Сначала выберите документ для проверки.', 'error');
             return;
@@ -723,8 +669,6 @@
             formData.append('document_id', elements.documentId.value.trim());
         }
         formData.append('include_parsed_document', 'true');
-        formData.append('chat_mode', state.chatMode);
-        formData.append('embed_mode', state.embedMode);
 
         try {
             const response = await fetch('/analyze-file', { method: 'POST', body: formData });
@@ -742,9 +686,6 @@
             renderReport();
             setStatus(`Проверка завершена: ${getActiveIssues().length} активных замечаний.`, 'success');
             elements.heroStatus.textContent = payload.status;
-            if (payload.runtime_modes) {
-                elements.heroMode.textContent = `chat ${payload.runtime_modes.chat_mode} / embed ${payload.runtime_modes.embed_mode}`;
-            }
         } catch (error) {
             setStatus(error.message, 'error');
             elements.heroStatus.textContent = 'ошибка';
@@ -849,9 +790,9 @@
 
         const parsed = report.parsed_document;
         if (parsed) {
-            elements.reportCaption.textContent = `Стандарт: ${report.standard_id}. Режим: chat ${state.chatMode}, embed ${state.embedMode}. Активных замечаний: ${summary.total_issues}.`;
+            elements.reportCaption.textContent = `Стандарт: ${report.standard_id}. Активных замечаний: ${summary.total_issues}.`;
         } else {
-            elements.reportCaption.textContent = `Стандарт: ${report.standard_id}. Режим: chat ${state.chatMode}, embed ${state.embedMode}.`;
+            elements.reportCaption.textContent = `Стандарт: ${report.standard_id}.`;
         }
     }
 

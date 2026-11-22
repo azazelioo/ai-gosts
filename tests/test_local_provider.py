@@ -62,64 +62,39 @@ class LocalProviderTests(unittest.TestCase):
     def test_local_chat_provider_calls_ollama_endpoint(self) -> None:
         provider = LocalChatProvider(base_url="http://127.0.0.1:11434", model="qwen2.5:7b", temperature=0.1)
 
-        with patch("app.llm.local_chat_provider.request.urlopen", return_value=_FakeHttpResponse({"response": "??????"})) as mocked:
-            result = provider.chat("??????? ?????")
+        replies = [_FakeHttpResponse({"details": {"format": "gguf"}}), _FakeHttpResponse({"response": "ответ"})]
+        with patch.object(provider._opener, "open", side_effect=replies) as mocked:
+            result = provider.chat("Вопрос по стандарту")
 
-        self.assertEqual(result, "??????")
+        self.assertEqual(result, "ответ")
+        first = mocked.call_args_list[0].args[0]
+        self.assertEqual(json.loads(first.data), {"model": "qwen2.5:7b"})
         request_obj = mocked.call_args.args[0]
         self.assertEqual(request_obj.full_url, "http://127.0.0.1:11434/api/generate")
         self.assertEqual(request_obj.get_method(), "POST")
         body = json.loads(request_obj.data.decode("utf-8"))
         self.assertEqual(body["model"], "qwen2.5:7b")
-        self.assertEqual(body["prompt"], "??????? ?????")
+        self.assertEqual(body["prompt"], "Вопрос по стандарту")
         self.assertFalse(body["stream"])
 
-    def test_dependencies_can_select_local_mode_via_legacy_model_mode(self) -> None:
-        old_mode = os.environ.get("MODEL_MODE")
-        old_chat = os.environ.get("CHAT_MODE")
-        try:
-            os.environ["MODEL_MODE"] = "local"
-            os.environ.pop("CHAT_MODE", None)
-            dependencies._chat_provider = None
-            provider = get_llm_provider()
-            self.assertIsInstance(provider, LocalChatProvider)
-        finally:
-            dependencies._chat_provider = None
-            if old_mode is None:
-                os.environ.pop("MODEL_MODE", None)
-            else:
-                os.environ["MODEL_MODE"] = old_mode
-            if old_chat is None:
-                os.environ.pop("CHAT_MODE", None)
-            else:
-                os.environ["CHAT_MODE"] = old_chat
-
-    def test_dependencies_can_split_chat_and_embedding_modes(self) -> None:
-        old_chat = os.environ.get("CHAT_MODE")
-        old_embed = os.environ.get("EMBED_MODE")
-        old_key = os.environ.get("MISTRAL_API_KEY")
-        try:
-            os.environ["CHAT_MODE"] = "local"
-            os.environ["EMBED_MODE"] = "local"
-            dependencies._chat_provider = None
-            dependencies._embedding_provider = None
-            self.assertIsInstance(get_chat_provider(), LocalChatProvider)
+    def test_legacy_settings_cannot_enable_a_remote_provider(self) -> None:
+        old_env = {"CHAT_MODE": "api", "EMBED_MODE": "api", "MODEL_MODE": "api", "MISTRAL_API_KEY": "test"}
+        with patch.dict(os.environ, old_env):
+            self.assertIsInstance(get_llm_provider(), LocalChatProvider)
             self.assertIsInstance(get_embedding_provider(), LocalProvider)
-        finally:
-            dependencies._chat_provider = None
-            dependencies._embedding_provider = None
-            if old_chat is None:
-                os.environ.pop("CHAT_MODE", None)
-            else:
-                os.environ["CHAT_MODE"] = old_chat
-            if old_embed is None:
-                os.environ.pop("EMBED_MODE", None)
-            else:
-                os.environ["EMBED_MODE"] = old_embed
-            if old_key is None:
-                os.environ.pop("MISTRAL_API_KEY", None)
-            else:
-                os.environ["MISTRAL_API_KEY"] = old_key
+            self.assertEqual(dependencies.resolve_runtime_modes(), ("local", "local"))
+
+    def test_external_chat_urls_are_rejected(self) -> None:
+        for url in ("https://example.com", "http://localhost@example.com", "http://ollama", "http://ollama.example.com"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                LocalChatProvider(base_url=url)
+
+    def test_remote_model_alias_never_receives_prompt(self) -> None:
+        provider = LocalChatProvider(model="alias")
+        with patch.object(provider, "_post_json", return_value={"remote_host": "example.com"}) as post:
+            with self.assertRaises(ValueError):
+                provider.chat("confidential")
+        post.assert_called_once_with("/api/show", {"model": "alias"})
 
     def test_local_pipeline_analyzes_document(self) -> None:
         StandardIngestor().ingest_pdf("gost_7_32_2017")

@@ -4,11 +4,11 @@ from store.graph import KnowledgeGraph
 from store.vector_store import VectorStore
 
 if TYPE_CHECKING:
-    from core.llm import MistralLLM
+    from app.legacy.core.llm import LocalLLM
 
 
 class GraphRAGEngine:
-    def __init__(self, knowledge_graph: KnowledgeGraph, vector_store: VectorStore, llm_client: "MistralLLM"):
+    def __init__(self, knowledge_graph: KnowledgeGraph, vector_store: VectorStore, llm_client: "LocalLLM"):
         self.graph = knowledge_graph
         self.vector_store = vector_store
         self.llm = llm_client

@@ -55,7 +55,7 @@ It parses instruction documents (guidelines, GOST standards, etc.), constructs a
 
 **Key Features:**
 *   **IndexRAG**: using idea from this paper[].
-*   **LLM Powered**: Uses Mistral AI(or Qwen2.5 for local mode) for entity extraction, embedding generation, and answer synthesis.
+*   **LLM Powered**: Uses a local Ollama model for generation and local MiniLM weights for embeddings.
 *   **Format Support**: DOCX is a main format.
 *   **Interactive UI**: Built-in FastAPI backend with a responsive HTML/JS frontend for real-time chat and processing.
 
@@ -66,7 +66,7 @@ It parses instruction documents (guidelines, GOST standards, etc.), constructs a
 This section should list any major frameworks/libraries used to bootstrap your project.
 
 *   FastAPI
-*   Mistral
+*   Ollama
 *   ChromaDB
 *   LlamaIndex
 *   Docker
@@ -78,31 +78,47 @@ This section should list any major frameworks/libraries used to bootstrap your p
 
 To get a local copy up and running follow these simple steps.
 
-### Prerequisites
+### Local installation
 
-You need to have Docker and Docker Compose installed to run the application easily.
-*   **Mistral API Key**: Get your key from [Mistral AI Console](https://console.mistral.ai/)
+Prepare the software and model weights before taking the machine offline. The
+application reads the FastEmbed cache and uses an Ollama model installed on the
+same machine. Old provider keys and mode environment variables have no effect.
+For existing indexes created with a different embedding model, build a separate
+local index from the original standards before using it for search.
 
-### Installation
+**Windows, native.** Install the dependencies from `requirements-docker.txt`
+in a virtual environment. Install Ollama and prepare `qwen2.5:1.5b` once
+(`ollama pull qwen2.5:1.5b` during setup, or transfer the installed model).
+Set `OLLAMA_NO_CLOUD=1` in the Ollama server environment before starting it.
+In PowerShell, point FastEmbed to the prepared cache and launch the application:
 
-1.  Clone the repo
-    ```sh
-    git clone https://github.com/art-kors/document-formatter.git
-    cd document-formatter
-    ```
-2.  Create an environment file
-    Create a file named `.env` in the root directory and add your Mistral API Key:
-    ```env
-    MISTRAL_API_KEY=your_api_key_here
-    ```
-    *(Important: Do not wrap the key in quotes).*
+```powershell
+$env:FASTEMBED_CACHE_PATH = "D:/Projects/gost-minilm-bench/models/fastembed"
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
 
-3.  Build and Run with Docker
-    ```sh
-    docker compose up --build
-    ```
-4.  Open your browser
-    Navigate to `http://127.0.0.1:8000`
+If preparing a new cache, run the following once on a machine with internet
+access and FastEmbed installed, then transfer the whole cache directory:
+
+```sh
+python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', cache_dir='models/fastembed')"
+```
+
+**Docker Compose.** Copy `.env.example` to `.env` and set
+`FASTEMBED_CACHE_PATH` to the host cache directory. Compose reuses its Ollama
+volume. To seed an empty volume from an installed Windows Ollama model store:
+
+```powershell
+docker compose build
+docker compose create
+docker cp "${env:USERPROFILE}/.ollama/models" document-formatter-ollama:/root/.ollama/
+docker compose up -d
+```
+
+Open `http://127.0.0.1:8000`. Only the web interface port is published. Both
+containers share an internal network. A missing chat model produces a local
+error. If embedding weights are missing, the existing hash fallback warns and
+produces 256-dimensional vectors. The MiniLM model produces 384.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -128,7 +144,7 @@ The workflow consists of two main stages: **Indexing** and **Querying**.
 <!-- ROADMAP -->
 ## Roadmap
 
-- [x] Basic RAG Pipeline with Mistral AI
+- [x] Basic RAG pipeline
 - [x] Knowledge Graph Integration (NetworkX)
 - [x] UI for File Upload and Chat
 - [x] Add support for image-based docs
@@ -182,8 +198,6 @@ Project Link: [Document Formatter](https://github.com/art-kors/document-formatte
 [FastAPI-url]: https://fastapi.tiangolo.com/
 [Python]: https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white
 [Python-url]: https://www.python.org/
-[Mistral]: https://img.shields.io/badge/Mistral_AI-FF7000?style=for-the-badge&logo=mistral&logoColor=white
-[Mistral-url]: https://mistral.ai/
 [ChromaDB]: https://img.shields.io/badge/ChromaDB-FF6F00?style=for-the-badge&logo=chromadb&logoColor=white
 [ChromaDB-url]: https://www.trychroma.com/
 [LlamaIndex]: https://img.shields.io/badge/LlamaIndex-00BFFF?style=for-the-badge&logo=llamaindex&logoColor=white
