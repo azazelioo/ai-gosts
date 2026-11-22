@@ -29,6 +29,8 @@ def summarize(report):
             "slowest_page": max(({"page": p["page"], "seconds": p["seconds"]} for p in pages),
                                 key=lambda p: p["seconds"], default=None),
             "pages_with_boxes": sum("preview" in page for page in pages),
+            "sketch_card_pages": [page["page"] for page in pages
+                                  if page.get("form", {}).get("type") == "sketch_card"],
             "image_review_pages": [page["page"] for page in pages if "review_image" in page],
             "pages_without_text_layer": sum(not page["has_text_layer"] for page in pages)}
 
@@ -44,7 +46,11 @@ def write_summary(dest, documents, seconds):
                      f'<td>{doc["pages_with_boxes"]}</td>')
             for key, _, _ in FIELDS:
                 field = doc["fields"][key]
-                cells += f'<td>{field["with_text"]} / {field["located"]}</td>'
+                counts = f'{field["with_text"]} / {field["located"]}'
+                if key == "profile_size" and doc["sketch_card_pages"]:
+                    links = [f'<a href="{doc["report"]}#page-{n}">{n}</a>' for n in doc["sketch_card_pages"]]
+                    counts += '<br>Не применимо (КЭ), стр. ' + ', '.join(links)
+                cells += f'<td>{counts}</td>'
             links = [f'<a href="{doc["report"]}#page-{n}">{n}</a>' for n in doc["image_review_pages"]]
             cells += '<td>' + (', '.join(links) or '—') + '</td>'
             slow = doc["slowest_page"]

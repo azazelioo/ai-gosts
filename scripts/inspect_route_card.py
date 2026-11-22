@@ -197,6 +197,84 @@ def scan_images(page):
     return [i for i in page.images if i["width"]*i["height"] >= .20*page.width*page.height]
 
 
+def footer_cell(sheet):
+    """Find the first ruled cell in the bottom strip of the upright form."""
+    width, height = sheet.size
+    if min(width, height) < 80:
+        return None
+    offset = int(height*.80)
+    strip = np.asarray(sheet.crop((0, offset, width, height)).convert("L")) < 190
+    rules = runs(strip[:, width//5:width*4//5].mean(axis=1) > .90)
+    if len(rules) < 2:
+        return None
+    top, bottom = rules[-2:]
+    if not 6 < bottom-top < height*.09:
+        return None
+    walls = runs(strip[top+2:bottom-1, :width//3].mean(axis=0) > .90)
+    if len(walls) < 2:
+        return None
+    left, right = walls[:2]
+    if left > width*.12 or not .035*width < right-left < .23*width:
+        return None
+    if min(strip[max(0,y-1):y+2, left:right].any(axis=0).mean() for y in (top,bottom)) < .9:
+        return None
+    return left, top+offset, right, bottom+offset
+
+
+def is_sketch_code(text):
+    return text.upper().replace("K", "К") == "КЭ"
+
+
+def find_sketch_marker(page, raster, regions, pdf_words, ocr, dest):
+    sx, sy = raster.width/page.width, raster.height/page.height
+    ox, oy = page.bbox[:2]
+    def raster_box(box):
+        l,t,r,b = box
+        return round((l-ox)*sx), round((t-oy)*sy), round((r-ox)*sx), round((b-oy)*sy)
+
+    words = [(w["text"], raster_box(word_box(w))) for w in pdf_words]
+    for region in regions:
+        x,y,r,b = raster_box(region)
+        crop = raster.crop((x,y,r,b))
+        for angle in (0, 90, 270, 180):
+            sheet = crop.rotate(-angle, expand=True) if angle else crop
+            cell = footer_cell(sheet)
+            if cell is None:
+                continue
+            l,t,right,bottom = rotate_box(cell, sheet.width, sheet.height, -angle % 360)
+            source = (x+l, y+t, x+right, y+bottom)
+            labels = [text for text,(wl,wt,wr,wb) in words
+                      if source[0] < (wl+wr)/2 < source[2] and source[1] < (wt+wb)/2 < source[3]]
+            l,t,right,bottom = cell
+            fragment = sheet.crop((l+3,t+3,right-3,bottom-3)).convert("L")
+            method = "pdf"
+            if labels:
+                text = " ".join(labels)
+                if not is_sketch_code(text):
+                    continue
+            else:
+                if not ocr or not ocr.ready():
+                    continue
+                method = "ocr"
+                text = ocr.line(sheet, cell, scan=True)
+                if not is_sketch_code(text):
+                    # A two-letter italic form code can look like a different word
+                    # before deskewing. Check the entire cell without a whitelist.
+                    upright = fragment.transform(fragment.size, Image.Transform.AFFINE,
+                                                 (1,-.32,.32*fragment.height/2,0,1,0),
+                                                 Image.Resampling.BICUBIC, fillcolor=255)
+                    enlarged = upright.resize((round(upright.width*2.3),round(upright.height*1.7)),
+                                              Image.Resampling.LANCZOS)
+                    text, score = ocr.recognize_line(enlarged)
+                    if score < 65 or not is_sketch_code(text):
+                        continue
+            filename = f"page-{page.page_number}-form-code.png"
+            sheet.crop((cell[0],cell[1],cell[2]+1,cell[3]+1)).save(dest/filename)
+            return {"type": "sketch_card", "code": "КЭ", "text": text, "method": method,
+                    "crop": filename, "box_pt": [round(v/s,2) for v,s in zip(source,(sx,sy,sx,sy))]}, angle
+    return None
+
+
 def scan_headings(page, source, images, ocr):
     """Return heading anchors in rotated full-page points, keeping the source PDF untouched."""
     sx, sy = source.width/page.width, source.height/page.height
@@ -372,8 +450,8 @@ def read_page(page, dest, ocr=None):
     raster = None
     scanned = False
     scan_words = []
+    images = scan_images(page) if ocr else []
     if ocr and not any(box is not None for box, _ in anchors):
-        images = scan_images(page)
         if images and ocr.ready():
             raster = page.to_image(resolution=DPI, force_mediabox=True, antialias=True).original
             match = scan_headings(page, raster, images, ocr)
@@ -388,6 +466,20 @@ def read_page(page, dest, ocr=None):
     result = {"page": page.page_number, "page_size_pt": [page.width, page.height],
               "has_text_layer": bool(page.chars),
               "rotation_clockwise": rotation, "fields": fields}
+    if fields["profile_size"]["method"] == "missing":
+        regions = [word_box(i) for i in images]
+        if any(is_sketch_code(w["text"]) for w in raw_words):
+            regions.append(page.bbox)
+        if regions:
+            if raster is None:
+                raster = page.to_image(resolution=DPI, force_mediabox=True, antialias=True).original
+            marker = find_sketch_marker(page, raster, regions, raw_words, ocr, dest)
+            if marker:
+                result["form"], marker_rotation = marker
+                if not any(box is not None for box, _ in anchors):
+                    result["rotation_clockwise"] = marker_rotation
+                fields["profile_size"].update(status="not_applicable", method="form_code",
+                                              note="Не применимо для карты эскизов (КЭ).")
     if any(box is not None for box, _ in anchors):
         image = raster if scanned else page.to_image(resolution=DPI, force_mediabox=True,
                                                      antialias=bool(rotation)).original
@@ -489,6 +581,9 @@ def write_report(dest, source, pages):
         parts = [f'<section id="page-{p["page"]}"><h2>Страница {p["page"]}</h2>']
         if p.get("rotation_clockwise"):
             parts.append(f'<p>Автоповорот по часовой стрелке на {p["rotation_clockwise"]}°.</p>')
+        if "form" in p:
+            parts.append(f'<p>Карта эскизов (КЭ)</p><img class="crop" src="{p["form"]["crop"]}" '
+                         'alt="Ячейка с обозначением формы КЭ">')
         if p.get("ocr_note"):
             parts.append(f'<p>{escape(p["ocr_note"])}</p>')
         if "preview" in p:
@@ -515,7 +610,7 @@ def write_report(dest, source, pages):
                         method = "Локальный OCR" if cell["text_method"] == "ocr" else "Декодирование Symbol"
                         parts.append(f'<p>{method}: <code>{escape(cell["text"])}</code></p>')
         section = "".join(parts) + "</section>"
-        if "preview" not in p and "review_image" not in p:
+        if "preview" not in p and "review_image" not in p and "form" not in p:
             section = f'<details><summary>Страница {p["page"]} · нет подтверждённых рамок</summary>{section}</details>'
         sections.append(section)
     html = ('<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
@@ -544,7 +639,7 @@ def analyze_document(source, dest, ocr, selection=None, progress=None):
             try:
                 result = read_page(page, dest, ocr)
                 # Full-document review: a page number alone can hide a raster appendix.
-                if selection is None and "preview" not in result and scan_images(page):
+                if selection is None and "preview" not in result and "form" not in result and scan_images(page):
                     name = f"page-{n}-review.jpg"
                     thumbnail = page.to_image(resolution=80, antialias=True).original.convert("RGB")
                     thumbnail.thumbnail((1000, 1000))
