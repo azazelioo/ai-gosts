@@ -1,0 +1,713 @@
+"""Local ESTD form detection, page analysis and evidence reports."""
+import hashlib
+import json
+import math
+import re
+from difflib import SequenceMatcher
+from html import escape
+from pathlib import Path
+from time import perf_counter
+
+import numpy as np
+import pdfplumber
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
+
+from .norms import normative_references
+
+
+LABEL = "Обозначение документа"
+SCHEMA_VERSION = 1
+DPI = 216
+HEADER = "#006bca"
+VALUE = "#bd4900"
+
+
+def runs(mask):
+    """Centres of contiguous line strokes, in pixels."""
+    idx = np.flatnonzero(mask)
+    groups = np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)
+    return [int((g[0] + g[-1]) // 2) for g in groups if len(g)]
+
+
+def surrounding(lines, start, end):
+    before = [x for x in lines if x < start]
+    after = [x for x in lines if x > end]
+    if before and after:
+        return before[-1], after[0]
+    return None
+
+
+# A field definition names its printed heading and tells where to read the value.
+FIELDS = (
+    ("designation", LABEL, "row_a"),
+    ("profile_size", "Профиль и размеры", "below"),
+)
+
+FORM_TYPES = {
+    "МК": ("route_card", "Маршрутная карта"),
+    "ОК": ("operation_card", "Операционная карта"),
+    "КЭ": ("sketch_card", "Карта эскизов"),
+}
+LOOKALIKE_LETTERS = str.maketrans("MOK", "МОК")
+
+
+def word_box(w):
+    return w["x0"], w["top"], w["x1"], w["bottom"]
+
+
+def glyph_rotation(char):
+    a, b = char["matrix"][:2]
+    angle = math.degrees(math.atan2(b, a))
+    quarter = round(angle / 90) * 90
+    return quarter % 360 if abs(angle - quarter) < 3 else None
+
+
+def form_rotation(chars, stream):
+    # Use printed form headings so upright marginal text cannot outvote the form.
+    angles = set()
+    for _, label, _ in FIELDS:
+        for hit in re.finditer(r"\s*".join(label.split()), stream, re.IGNORECASE):
+            angles.update(glyph_rotation(c) for c in chars[hit.start():hit.end()] if c["text"].strip())
+    return angles.pop() if len(angles) == 1 and None not in angles else 0
+
+
+def rotate_box(box, width, height, degrees):
+    l, t, r, b = box
+    if degrees == 90:
+        return height-b, l, height-t, r
+    if degrees == 180:
+        return width-r, height-b, width-l, height-t
+    if degrees == 270:
+        return t, width-r, b, width-l
+    return box
+
+
+def rotated_chars(page, degrees):
+    ox, oy = page.bbox[:2]
+    result = []
+    for c in page.chars:
+        if glyph_rotation(c) != degrees:
+            continue
+        local = c["x0"]-ox, c["top"]-oy, c["x1"]-ox, c["bottom"]-oy
+        l,t,r,b = rotate_box(local, page.width, page.height, degrees)
+        result.append(dict(c, x0=l, top=t, x1=r, bottom=b, doctop=t, upright=True,
+                           width=r-l, height=b-t))
+    return result
+
+
+class LocalOCR:
+    """Load Russian Tesseract data on demand and reuse it across selected pages."""
+
+    def __init__(self, stack, tessdata):
+        self.stack = stack
+        self.path = tessdata
+        self.engine = None
+        self.unavailable = False
+
+    def ready(self):
+        if self.unavailable:
+            return False
+        if self.engine is None:
+            try:
+                from tesserocr import PyTessBaseAPI, PSM
+                self.engine = self.stack.enter_context(
+                    PyTessBaseAPI(path=str(self.path), lang="rus", psm=PSM.SINGLE_LINE))
+            except (ImportError, RuntimeError, OSError):
+                self.unavailable = True
+                return False
+        return True
+
+    def recognize_line(self, fragment):
+        self.engine.SetImage(ImageOps.expand(fragment, border=12, fill="white"))
+        return " ".join(self.engine.GetUTF8Text().split()), self.engine.MeanTextConf()
+
+    def line(self, image, box, scan=False):
+        if not self.ready():
+            return ""
+        l,t,r,b = box
+        if r-l <= 6 or b-t <= 6:
+            return ""
+        fragment = image.crop((l+3, t+3, r-3, b-3))
+        text, score = self.recognize_line(fragment)
+        if scan and score < 90 and sum(c.isalpha() for c in text) >= 2 and not any(c.isdigit() for c in text):
+            alternative, confidence = self.recognize_line(engineering_text(fragment))
+            if text == alternative and text.isalpha() and max(score, confidence) < 65:
+                # Retry a consistently read but uncertain word at a larger scale.
+                # A different spelling cannot override the two earlier readings.
+                gray = fragment.convert("L")
+                bounds = gray.point(lambda p: 255 if p < 160 else 0).getbbox()
+                if bounds:
+                    word = ImageOps.expand(gray.crop(bounds), border=4, fill=255)
+                    for slope in (.20, .28):
+                        straight = word.transform(word.size, Image.Transform.AFFINE,
+                                                  (1, -slope, slope*word.height/2, 0, 1, 0),
+                                                  Image.Resampling.BICUBIC, fillcolor=255)
+                        enlarged = straight.resize((int(word.width*1.6), int(word.height*1.6)),
+                                                   Image.Resampling.LANCZOS)
+                        confirmed, rating = self.recognize_line(enlarged)
+                        if confirmed == text and rating >= 65:
+                            return text
+            if confidence > score:
+                text, score = alternative, confidence
+        return text if score >= 65 else ""
+
+    def scan_lines(self, image):
+        from tesserocr import PSM, RIL, iterate_level
+        self.engine.SetPageSegMode(PSM.SPARSE_TEXT)
+        try:
+            self.engine.SetImage(image)
+            self.engine.Recognize()
+            it = self.engine.GetIterator()
+            return [(item.GetUTF8Text(RIL.TEXTLINE).strip(), item.BoundingBox(RIL.TEXTLINE))
+                    for item in iterate_level(it, RIL.TEXTLINE) if not item.Empty(RIL.TEXTLINE)]
+        finally:
+            self.engine.SetPageSegMode(PSM.SINGLE_LINE)
+
+
+def engineering_text(fragment):
+    """Open cramped gaps after isolated baseline dots, then straighten condensed italic lettering."""
+    from scipy.ndimage import find_objects, label
+    gray = fragment.convert("L")
+    ink = np.asarray(gray) < 160
+    ys = np.flatnonzero(ink.any(axis=1))
+    if not len(ys):
+        return gray
+    height = int(ys[-1] - ys[0] + 1)
+    dots = []
+    for y, x in find_objects(label(ink, structure=np.ones((3, 3), dtype=bool))[0]):
+        if (x.stop-x.start <= max(2, height*.16) and y.stop-y.start <= max(2, height*.16)
+                and ys[0]+.65*height <= y.stop <= ys[-1]+1 and x.stop < gray.width-1
+                and not ink[:, x.stop].any()):
+            dots.append(x.stop)
+    gap = max(2, round(height / 3))
+    for cut in sorted(set(dots), reverse=True):
+        wider = Image.new("L", (gray.width+gap, gray.height), 255)
+        wider.paste(gray.crop((0, 0, cut, gray.height)))
+        wider.paste(gray.crop((cut, 0, gray.width, gray.height)), (cut+gap, 0))
+        gray = wider
+    gray = ImageOps.expand(gray, border=5, fill=255)
+    gray = gray.transform(gray.size, Image.Transform.AFFINE, (1,-.32,.32*gray.height,0,1,0),
+                          Image.Resampling.BICUBIC, fillcolor=255)
+    return gray.resize((round(gray.width*3.3), gray.height*2),
+                       Image.Resampling.LANCZOS).filter(ImageFilter.MinFilter(3))
+
+
+def scan_images(page):
+    if sum(len(c["text"].strip()) for c in page.chars) > 40:
+        return []
+    return [i for i in page.images if i["width"]*i["height"] >= .20*page.width*page.height]
+
+
+def footer_cell(sheet):
+    """Find the first ruled cell in the bottom strip of the upright form."""
+    width, height = sheet.size
+    if min(width, height) < 80:
+        return None
+    offset = int(height*.70)
+    strip = np.asarray(sheet.crop((0, offset, width, height)).convert("L")) < 190
+    rows = np.flatnonzero(strip[:, width//5:width*4//5].mean(axis=1) > .90)
+    rules = np.split(rows, np.flatnonzero(np.diff(rows) > 1)+1)
+    if len(rules) < 2:
+        return None
+    # Some published forms sit inside an additional frame. Its lower margin
+    # has no enclosed code cell; the last row of the form is directly above it.
+    for i in range(len(rules)-1, max(0, len(rules)-3), -1):
+        upper, lower = rules[i-1:i+1]
+        top, bottom = (int((band[0]+band[-1])//2) for band in (upper, lower))
+        if not 6 < bottom-top < height*.09:
+            continue
+        walls = runs(strip[top+2:bottom-1, :width//3].mean(axis=0) > .90)
+        for left, right in zip(walls, walls[1:]):
+            if left > width*.18 or not .035*width < right-left < .23*width:
+                continue
+            if min(strip[max(0,band[0]-1):band[-1]+2, left:right].any(axis=0).mean()
+                   for band in (upper, lower)) >= .9:
+                return left, top+offset, right, bottom+offset
+    return None
+
+
+def form_code(text):
+    code = text.strip().upper().translate(LOOKALIKE_LETTERS)
+    return code if code in FORM_TYPES else None
+
+
+def has_native_footer_code(page, chars, stream):
+    # PDF drawing order need not include a separator before or after the code.
+    # A candidate only triggers rendering; the complete cell is checked below.
+    ox, oy = page.bbox[:2]
+    for hit in re.finditer(r"(?=(?:М\s*К|О\s*К|К\s*Э))", stream.translate(LOOKALIKE_LETTERS)):
+        char = chars[hit.start()]
+        angle = glyph_rotation(char)
+        if angle is None:
+            continue
+        l,t,r,b = word_box(char)
+        box = rotate_box((l-ox,t-oy,r-ox,b-oy), page.width, page.height, angle)
+        w,h = (page.height,page.width) if angle in (90,270) else (page.width,page.height)
+        if box[0] < .30*w and box[3] > .70*h:
+            return True
+    return False
+
+
+def find_form_marker(page, raster, regions, source_tokens, ocr, dest):
+    sx, sy = raster.width/page.width, raster.height/page.height
+    ox, oy = page.bbox[:2]
+    def raster_box(box):
+        l,t,r,b = box
+        return round((l-ox)*sx), round((t-oy)*sy), round((r-ox)*sx), round((b-oy)*sy)
+
+    words = [(w["text"], raster_box(word_box(w))) for w in source_tokens if w["text"].strip()]
+    for region in regions:
+        x,y,r,b = raster_box(region)
+        crop = raster.crop((x,y,r,b))
+        for angle in (0, 90, 270, 180):
+            sheet = crop.rotate(-angle, expand=True) if angle else crop
+            cell = footer_cell(sheet)
+            if cell is None:
+                continue
+            l,t,right,bottom = rotate_box(cell, sheet.width, sheet.height, -angle % 360)
+            source = (x+l, y+t, x+right, y+bottom)
+            labels = [text for text,(wl,wt,wr,wb) in words
+                      if source[0] < (wl+wr)/2 < source[2] and source[1] < (wt+wb)/2 < source[3]]
+            l,t,right,bottom = cell
+            fragment = sheet.crop((l+3,t+3,right-3,bottom-3)).convert("L")
+            method = "pdf"
+            if labels:
+                text = "".join(labels)
+                if not form_code(text):
+                    continue
+            else:
+                if not ocr or not ocr.ready():
+                    continue
+                method = "ocr"
+                text = ocr.line(sheet, cell, scan=True)
+                if not form_code(text):
+                    # A two-letter italic form code can look like a different word
+                    # before deskewing. Check the entire cell without a whitelist.
+                    upright = fragment.transform(fragment.size, Image.Transform.AFFINE,
+                                                 (1,-.32,.32*fragment.height/2,0,1,0),
+                                                 Image.Resampling.BICUBIC, fillcolor=255)
+                    enlarged = upright.resize((round(upright.width*2.3),round(upright.height*1.7)),
+                                              Image.Resampling.LANCZOS)
+                    text, score = ocr.recognize_line(enlarged)
+                    if score < 65 or not form_code(text):
+                        continue
+            filename = f"page-{page.page_number}-form-code.png"
+            sheet.crop((cell[0],cell[1],cell[2]+1,cell[3]+1)).save(dest/filename)
+            code = form_code(text)
+            return {"type": FORM_TYPES[code][0], "code": code, "text": text, "method": method,
+                    "crop": filename, "box_pt": [round(v/s,2) for v,s in zip(source,(sx,sy,sx,sy))]}, angle
+    return None
+
+
+def scan_headings(page, source, images, ocr):
+    """Return heading anchors in rotated full-page points, keeping the source PDF untouched."""
+    sx, sy = source.width/page.width, source.height/page.height
+    ox, oy = page.bbox[:2]
+    for obj in images:
+        box = tuple(round(v*s) for v, s in zip((obj["x0"]-ox,obj["top"]-oy,obj["x1"]-ox,obj["bottom"]-oy),
+                                               (sx, sy, sx, sy)))
+        crop = source.crop(box).convert("L")
+        for angle in ((90, 270, 0, 180) if crop.height > crop.width else (0, 180, 90, 270)):
+            rotated = crop.rotate(-angle, expand=True) if angle else crop
+            lines = ocr.scan_lines(rotated)
+            left,top,_,_ = rotate_box(box, source.width, source.height, angle)
+            scale_x,scale_y = (sy,sx) if angle in (90,270) else (sx,sy)
+            anchors = []
+            for _, name, _ in FIELDS:
+                hits = [bounds for line,bounds in lines if SequenceMatcher(
+                    None, line.casefold(), name.casefold()).ratio() >= .89]
+                if len(hits) == 1:
+                    l,t,r,b = hits[0]
+                    anchors.append((((left+l)/scale_x,(top+t)/scale_y,
+                                     (left+r)/scale_x,(top+b)/scale_y), "scan_ocr"))
+                else:
+                    anchors.append((None, "ambiguous" if hits else "missing"))
+            if any(box is not None for box, _ in anchors):
+                evidence = [(line, left+l, top+t, left+r, top+b) for line,(l,t,r,b) in lines]
+                return angle, anchors, evidence
+    return None
+
+
+def symbol_profile(chars):
+    # Symbol encodes spaces, digits and operators in the private-use area.
+    # Decode individual in-cell glyphs before assembling words across PDF spaces.
+    mapping = {0xF020: " ", 0xF0B4: "×", 0xF0C6: "∅", 0xF02C: ",", 0xF02E: "."}
+    decoded = []
+    found = False
+    for c in chars:
+        text = c["text"]
+        if c["fontname"].split("+")[-1].casefold() == "symbol" and len(text) == 1:
+            code = ord(text)
+            if 0xF000 <= code <= 0xF0FF:
+                found = True
+                text = chr(code-0xF000) if 0xF030 <= code <= 0xF039 else mapping.get(code)
+                if text is None:
+                    return ""
+        decoded.append(dict(c, text=text))
+    if not found:
+        return ""
+    value = " ".join(w["text"] for w in pdfplumber.utils.extract_words(decoded))
+    return re.sub(r"∅\s*(?=\d)", "⌀ ", value)
+
+
+def find_anchor(chars, stream, words_by_text, label):
+    tokens = label.casefold().split()
+    matches = [(word_box(w), w) for w in words_by_text.get(tokens[0], ())]
+    for token in tokens[1:]:
+        extended = []
+        for box, prev in matches:
+            height = max(1, prev["bottom"] - prev["top"])
+            for w in words_by_text.get(token, ()):
+                if (0 <= w["x0"] - prev["x1"] <= 2 * height
+                        and abs(w["top"] - prev["top"]) < height / 2):
+                    extended.append(((box[0], min(box[1], w["top"]), w["x1"],
+                                      max(box[3], w["bottom"])), w))
+        matches = extended
+    if matches:
+        return (matches[0][0], "words") if len(matches) == 1 else (None, "ambiguous")
+
+    # A broken OCR layer can place successive glyphs backwards in a line.
+    # Require the full literal heading in PDF stream order and the same baseline;
+    # the approximate location still has to pass the four-border raster check.
+    hits = list(re.finditer(r"\s*".join(map(re.escape, tokens)), stream, re.IGNORECASE))
+    if len(hits) != 1:
+        return None, "ambiguous" if hits else "missing"
+    glyphs = chars[hits[0].start():hits[0].end()]
+    height = max(c["height"] for c in glyphs)
+    first = glyphs[:len(tokens[0])]
+    if (max(c["top"] for c in glyphs) - min(c["top"] for c in glyphs) > height/2
+            or sum(a["x0"] > b["x0"] for a, b in zip(first, first[1:])) < len(first)/2):
+        return None, "missing"
+    box = (min(c["x0"] for c in glyphs), min(c["top"] for c in glyphs),
+           max(c["x1"] for c in glyphs), max(c["bottom"] for c in glyphs))
+    return box, "pdf_stream"
+
+
+def locate(ink, anchor, words, layout, read_marker=None):
+    x0, y0, x1, y1 = anchor
+    height = max(1, y1-y0)
+    if x1 <= x0:
+        return None, None, "Недостаточно геометрических данных."
+    # Work on a strip around the label instead of three full-page masks.
+    start = max(0, y0 - 5*height)
+    stop = min(ink.shape[0], y1 + 15*height)
+    band = ink[start:stop]
+    pad = np.pad(band, ((1, 1), (0, 0)))
+    horiz = pad[:-2] | pad[1:-1] | pad[2:]
+    cy = (y0+y1)//2 - start
+    edges = surrounding(runs(horiz[:, x0:x1].mean(axis=1) > .84), cy, cy)
+    if not edges or edges[1] - edges[0] > 4*height:
+        return None, None, "Горизонтальные границы не подтверждены."
+    top, bottom = edges
+    pad = np.pad(band[top:bottom+1], ((0, 0), (1, 1)))
+    vert = pad[:, :-2] | pad[:, 1:-1] | pad[:, 2:]
+    sides = surrounding(runs(vert.mean(axis=0) > .91), x0, x1)
+    if not sides:
+        return None, None, "Боковые границы не подтверждены."
+    left, right = sides
+    if min(horiz[k, left:right].mean() for k in edges) < .80:
+        return None, None, "Не подтверждена полная ширина ячейки."
+    header = (left, start+top, right, start+bottom)
+    # A dashed inner divider can disappear from the raster projection. If
+    # another printed heading is captured, do not return the combined cell.
+    for text, wx0, wy0, wx1, wy1 in words:
+        center_x = (wx0 + wx1) / 2
+        if (header[1] < (wy0 + wy1)/2 < header[3] and left < center_x < right
+                and not x0 <= center_x <= x1 and sum(c.isalpha() for c in text) >= 3):
+            return None, None, "Внутри рамки есть посторонняя подпись. Нужен просмотр."
+    rows = runs(horiz[:, left:right].mean(axis=1) > .80)
+    bounds = None
+    if layout == "below":
+        lower = next((y for y in rows if y > bottom+2), None)
+        if lower is not None and .6*height < lower-bottom < 4*height:
+            # Both vertical borders must continue through the value row.
+            if all(band[bottom:lower+1, max(0,x-2):x+3].any(axis=1).mean() > .80
+                   for x in sides):
+                bounds = bottom, lower
+    elif layout == "row_a":
+        centers = sorted((w[2]+w[4])//2-start for w in words
+                         if re.fullmatch(r"[АA](?:\d{2})?", w[0]) and w[3] < left
+                         and start+bottom < (w[2]+w[4])/2 < start+bottom+8*height)
+        if centers:
+            bounds = surrounding(rows, centers[0], centers[0])
+        elif read_marker:
+            # The printed A heading identifies the service-code column. Read only
+            # that cell when the operation rows have been converted to outlines.
+            markers = [w for w in words if w[0] in ("А", "A") and w[3] < left
+                       and header[1] < (w[2]+w[4])/2 < header[3]]
+            if len(markers) == 1:
+                marker = markers[0]
+                for upper, lower in zip(rows, rows[1:]):
+                    if upper < bottom-2 or not .6*height < lower-upper < 4*height:
+                        continue
+                    section = band[upper+2:lower-1, :left]
+                    walls = runs(section.mean(axis=0) > .8)
+                    cell = surrounding(walls, marker[1], marker[3])
+                    if cell and cell[1]-cell[0] < 10*height:
+                        match = read_marker((cell[0], start+upper, cell[1], start+lower))
+                        if match is None:
+                            break  # An unreadable earlier marker could itself be row A.
+                        if match:
+                            bounds = upper, lower
+                            break
+    else:
+        raise ValueError(f"Unknown field layout: {layout}")
+    if bounds and bounds[0] >= bottom-2 and .6*height < bounds[1]-bounds[0] < 4*height:
+        return header, (left, start+bounds[0], right, start+bounds[1]), "Сверьте текст PDF с оригиналом."
+    return header, None, "Заголовок найден. Область значения требует просмотра."
+
+
+def read_page(page, dest, ocr=None):
+    chars = page.chars
+    stream = "".join(c["text"] if len(c["text"]) == 1 else "\ufffd" for c in chars)
+    native_footer = bool(chars) and has_native_footer_code(page, chars, stream)
+    rotation = form_rotation(chars, stream)
+    if rotation:
+        chars = rotated_chars(page, rotation)
+        stream = "".join(c["text"] if len(c["text"]) == 1 else "\ufffd" for c in chars)
+        raw_words = pdfplumber.utils.extract_words(chars)
+    else:
+        raw_words = page.extract_words()
+    by_text = {}
+    for w in raw_words:
+        by_text.setdefault(w["text"].casefold(), []).append(w)
+    anchors = [find_anchor(chars, stream, by_text, label) for _, label, _ in FIELDS]
+    raster = None
+    scanned = False
+    scan_words = []
+    images = scan_images(page) if ocr else []
+    if ocr and not any(box is not None for box, _ in anchors):
+        if images and ocr.ready():
+            raster = page.to_image(resolution=DPI, force_mediabox=True, antialias=True).original
+            match = scan_headings(page, raster, images, ocr)
+            if match:
+                rotation, anchors, scan_words = match
+                scanned = True
+                raw_words, chars = [], []
+    fields = {}
+    for (key, label, _), (_, method) in zip(FIELDS, anchors):
+        fields[key] = {"label": label, "method": method, "status": "review", "header": None,
+                       "value": None, "note": "Нет однозначного текстового якоря."}
+    result = {"page": page.page_number, "page_size_pt": [page.width, page.height],
+              "has_text_layer": bool(page.chars),
+              "rotation_clockwise": rotation, "fields": fields}
+    regions = [word_box(i) for i in images]
+    if native_footer:
+        regions.append(page.bbox)
+    if regions:
+        if raster is None:
+            raster = page.to_image(resolution=DPI, force_mediabox=True, antialias=bool(rotation or images)).original
+        marker = find_form_marker(page, raster, regions, page.chars, ocr if images else None, dest)
+        if marker:
+            result["form"], marker_rotation = marker
+            if not any(box is not None for box, _ in anchors):
+                result["rotation_clockwise"] = marker_rotation
+            if result["form"]["code"] == "КЭ" and fields["profile_size"]["method"] == "missing":
+                fields["profile_size"].update(status="not_applicable", method="form_code",
+                                              note="Не применимо для карты эскизов (КЭ).")
+    if any(box is not None for box, _ in anchors):
+        image = raster if raster is not None else page.to_image(resolution=DPI, force_mediabox=True,
+                                                                antialias=bool(rotation)).original
+        source_sx, source_sy = image.width/page.width, image.height/page.height
+        sx, sy = source_sx, source_sy
+        ox, oy = (0, 0) if scanned else page.bbox[:2]
+        if rotation:
+            transpose = {90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180,
+                         270: Image.Transpose.ROTATE_90}
+            image = image.transpose(transpose[rotation])
+            ox = oy = 0
+            if rotation in (90, 270):
+                sx, sy = sy, sx
+
+        def pixels(box):
+            l,t,r,b = box
+            return round((l-ox)*sx), round((t-oy)*sy), round((r-ox)*sx), round((b-oy)*sy)
+
+        words = [(w["text"], *pixels(word_box(w))) for w in raw_words]
+        ink = np.asarray(image.convert("L")) < (205 if scanned else 150)
+
+        def region(box, kind):
+            l,t,r,b = box
+            parts = [(x0, text) for text,x0,y0,x1,y1 in words
+                     if max(0, min(x1,r)-max(x0,l)) >= .75*max(1,x1-x0) and t < (y0+y1)/2 < b]
+            filename = f"page-{page.page_number}-{kind}.png"
+            image.crop((l,t,r+1,b+1)).save(dest / filename)
+            source_box = rotate_box(box, image.width, image.height, -rotation % 360)
+            raw = " ".join(text for _,text in sorted(parts))
+            cell = {"kind": kind, "box_px": list(source_box),
+                    "box_pt": [round(v/scale, 2) for v, scale in zip(
+                        source_box, (source_sx, source_sy, source_sx, source_sy))],
+                    "raw_text": raw, "text": raw, "text_method": "pdf" if raw else "unread",
+                    "crop": filename}
+            if kind == "profile_size-value":
+                glyphs = [c for c in chars if l < ((c["x0"]+c["x1"])/2-ox)*sx < r
+                          and t < ((c["top"]+c["bottom"])/2-oy)*sy < b]
+                value = symbol_profile(glyphs)
+                if value:
+                    cell.update(text=value, text_method="pdf_symbol")
+            if kind in ("row-a", "profile_size-value") and not cell["text"] and ocr:
+                value = ocr.line(image, box, scan=scanned)
+                if value:
+                    cell.update(text=value, text_method="ocr")
+            return cell
+
+        outlines = []
+        for (key, _, layout), (box, _) in zip(FIELDS, anchors):
+            if box is None:
+                continue
+            entry = fields[key]
+            def read_marker(marker_box):
+                text = ocr.line(image, marker_box)
+                marker = re.fullmatch(r"([А-ЯA])\s*(\d{2})?", text)
+                if not marker:
+                    return None
+                if marker[1] in ("А", "A") and marker[2]:
+                    entry["row_label"] = "А" + marker[2]
+                    return True
+                return False
+
+            header, value, note = locate(ink, pixels(box), scan_words if scanned else words,
+                                         layout, read_marker if ocr else None)
+            entry["note"] = note
+            if header:
+                entry["header"] = region(header, "header" if key == "designation" else key+"-header")
+                if scanned:
+                    heading_box = pixels(box)
+                    entry["header"].update(text=next(w[0] for w in scan_words
+                                                     if w[1:] == heading_box), text_method="ocr")
+                entry["status"] = "header_only"
+                outlines.append((header, HEADER))
+            if value:
+                entry["value"] = region(value, "row-a" if key == "designation" else key+"-value")
+                entry["status"] = "located"
+                outlines.append((value, VALUE))
+        if outlines:
+            draw = ImageDraw.Draw(image)
+            for box, color in outlines:
+                draw.rectangle(box, outline=color, width=4)
+            image.thumbnail((1650, 1650))
+            result["preview"] = f"page-{page.page_number}.png"
+            image.save(dest / result["preview"], compress_level=2)
+    if ocr and ocr.unavailable:
+        result["ocr_note"] = "Локальный OCR недоступен. Проверьте tesserocr и каталог rus.traineddata."
+    # Preserve the original designation-field contract for earlier consumers.
+    primary = fields["designation"]
+    result.update(status=primary["status"], note=primary["note"], header=primary["header"],
+                  first_row_a=primary["value"])
+    return result
+
+
+def write_report(dest, source, pages):
+    sections = []
+    navigation = " ".join(
+        f'<a href="#page-{p["page"]}">{p["page"]}</a>' for p in pages if "preview" in p
+    )
+    for p in pages:
+        parts = [f'<section id="page-{p["page"]}"><h2>Страница {p["page"]}</h2>']
+        if p.get("rotation_clockwise"):
+            parts.append(f'<p>Автоповорот по часовой стрелке на {p["rotation_clockwise"]}°.</p>')
+        if "form" in p:
+            code = p["form"]["code"]
+            parts.append(f'<p>{FORM_TYPES[code][1]} ({code})</p><img class="crop" src="{p["form"]["crop"]}" '
+                         f'alt="Ячейка с обозначением формы {code}">')
+            prediction = p["form"].get("model_prediction")
+            if prediction:
+                predicted = prediction.get("code") or "не прочитана"
+                parts.append(f'<p>Независимое чтение ячейки моделью: {escape(predicted)}</p>')
+        if p.get("ocr_note"):
+            parts.append(f'<p>{escape(p["ocr_note"])}</p>')
+        if "preview" in p:
+            parts.append(f'<a href="{p["preview"]}"><img loading="lazy" class="sheet" src="{p["preview"]}" alt="Разметка листа"></a>')
+        if "review_image" in p:
+            parts.append(f'<p>Мало доступного текста, основная часть листа может находиться в изображении.</p>'
+                         f'<a href="{p["review_image"]}"><img loading="lazy" class="sheet" src="{p["review_image"]}" '
+                         f'alt="Миниатюра страницы для просмотра"></a>')
+        refs = {ref["field"]: ref for ref in normative_references(p.get("form", {}).get("code"))}
+        for field_key, field in p["fields"].items():
+            parts.append(f'<h3>{escape(field["label"])}</h3><p>{escape(field["note"])}</p>')
+            if field_key in refs:
+                ref = refs[field_key]
+                parts.append(f'<p>{escape(ref["standard"])} ({escape(ref["edition"])}), '
+                             f'{escape(ref["clause"])}. {escape(ref["answer"])}</p>')
+            if "row_label" in field:
+                parts.append(f'<p>Строка {escape(field["row_label"])}</p>')
+            if field["method"] == "pdf_stream":
+                parts.append("<p>Название восстановлено по порядку символов PDF. Ниже сохранён исходный текст слоя.</p>")
+            elif field["method"] == "scan_ocr":
+                parts.append("<p>Заголовок найден локальным OCR на изображении таблицы.</p>")
+            for key, title in [("header", "Синий контур · заголовок"), ("value", "Оранжевый контур · значение")]:
+                cell = field[key]
+                if cell:
+                    text = cell["raw_text"] or "Текстовый слой не дал символов"
+                    parts.append(f'<p>{title}</p><img loading="lazy" class="crop" src="{cell["crop"]}" alt="Исходный фрагмент">'
+                                 f'<p>Текст PDF: <code>{escape(text)}</code></p>')
+                    if cell["text_method"] in ("ocr", "pdf_symbol"):
+                        method = "Локальный OCR" if cell["text_method"] == "ocr" else "Декодирование Symbol"
+                        parts.append(f'<p>{method}: <code>{escape(cell["text"])}</code></p>')
+        section = "".join(parts) + "</section>"
+        if "preview" not in p and "review_image" not in p and "form" not in p:
+            section = f'<details><summary>Страница {p["page"]} · нет подтверждённых рамок</summary>{section}</details>'
+        sections.append(section)
+    html = ('<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+            '<title>Графы маршрутной карты</title><style>body{font:17px/1.5 system-ui,sans-serif;max-width:1000px;'
+            'margin:30px auto;padding:0 18px;color:#162737;background:#fafafa}section{padding:15px 0 30px;'
+            'border-top:1px solid #aaa}.sheet{width:100%;height:auto}.crop{max-width:100%;background:white;'
+            'outline:1px solid #ccc}h2,h3{margin-bottom:.4em}code{overflow-wrap:anywhere}</style>'
+            f'<h1>Графы маршрутной карты</h1><p>{escape(source.name)} · физические страницы PDF</p>'
+            + (f'<p>Листы с разметкой: {navigation}</p>' if navigation else "")
+            + "".join(sections) + "</html>")
+    (dest / "index.html").write_text(html, encoding="utf-8")
+
+
+def analyze_document(source, dest, ocr, selection=None, progress=None, classifier=None):
+    """Inspect physical pages in order; None selects the complete document."""
+    with pdfplumber.open(source) as pdf:
+        count = len(pdf.pages)
+        requested = range(1, count+1) if selection is None else selection
+        if any(n < 1 or n > count for n in requested):
+            raise ValueError(f"PDF pages must be in 1..{count}")
+        dest.mkdir(parents=True, exist_ok=True)
+        pages = []
+        for n in dict.fromkeys(requested):
+            page = pdf.pages[n-1]
+            tick = perf_counter()
+            try:
+                result = read_page(page, dest, ocr)
+                for ref in normative_references(result.get("form", {}).get("code")):
+                    if ref["field"]:
+                        result.setdefault("field_references", {})[ref["field"]] = ref["id"]
+                if classifier is not None and "form" in result:
+                    form = result["form"]
+                    try:
+                        prediction = classifier.predict(dest/form["crop"])
+                        form["model_prediction"] = {"code": prediction, "agrees": prediction == form["code"]}
+                    except ValueError as exc:
+                        form["model_prediction"] = {"code": None, "reason": str(exc)}
+                # Full-document review: a page number alone can hide a raster appendix.
+                if (selection is None and "preview" not in result and
+                        result["fields"]["profile_size"]["status"] != "not_applicable" and scan_images(page)):
+                    name = f"page-{n}-review.jpg"
+                    thumbnail = page.to_image(resolution=80, antialias=True).original.convert("RGB")
+                    thumbnail.thumbnail((1000, 1000))
+                    thumbnail.save(dest/name, quality=80)
+                    result["review_image"] = name
+                if selection is None:
+                    result["seconds"] = round(perf_counter()-tick, 4)
+                pages.append(result)
+            finally:
+                page.close()
+            if progress and (n % 25 == 0 or n == count):
+                progress(n, count)
+    with source.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    report = {"module": "estd", "schema_version": SCHEMA_VERSION, "source": source.name,
+              "supported_form_found": any("form" in page for page in pages),
+              "sha256": digest, "label": LABEL, "dpi": DPI,
+              "coordinates": "page-relative, top-left origin; box_px at render DPI", "pages": pages}
+    report["normative_references"] = [ref for code in sorted({p["form"]["code"] for p in pages if "form" in p})
+                                      for ref in normative_references(code)]
+    if classifier is not None:
+        report["form_model_sha256"] = classifier.sha256
+    (dest / "result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_report(dest, source, pages)
+    return report

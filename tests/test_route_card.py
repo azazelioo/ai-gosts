@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 if all(importlib.util.find_spec(m) for m in ("pdfplumber", "numpy", "PIL")):
     import numpy as np
-    from scripts import inspect_route_card as reader
+    from estd import reader
     from scripts import inspect_route_batch as batch
 else:
     reader = None
