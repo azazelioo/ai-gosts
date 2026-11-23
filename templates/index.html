@@ -474,6 +474,14 @@
                 grid-template-columns: 1fr;
             }
         }
+        #document-review { margin: 1.5rem 0; }
+        #review-text { max-height: 62vh; overflow: auto; padding: 1rem; border: 1px solid #bfcbd2; background: white; color: #243642; }
+        #review-text p { margin: .55rem 0; }
+        .review-anchor { margin: .5rem 0; }
+        .review-anchor summary { background: #fff0c5; border-left: 3px solid #966300; padding: .4rem; cursor: pointer; }
+        .review-note { border-left: 3px solid #aebfc8; padding: .6rem 1rem; }
+        #document-review button { cursor: pointer; padding: .4rem .7rem; }
+        #document-review[hidden], #save-review[hidden], #download-fixed-button[hidden] { display: none; }
     </style>
 </head>
 <body>
@@ -554,6 +562,13 @@
         </div>
 
         <div class="summary-grid" id="summary-grid"></div>
+        <section id="document-review" hidden>
+            <h3>Текст документа</h3>
+            <p>Наведите указатель на выделенный абзац или откройте его нажатием. Правки сохраняются в рабочей копии.</p>
+            <button type="button" id="save-review" hidden>Скачать рабочую копию DOCX</button>
+            <div id="review-text"></div>
+            <p id="review-feedback" role="status"></p>
+        </section>
 
         <div class="toolbar">
             <div class="filter-row" id="type-filters"></div>
@@ -641,6 +656,8 @@
     }
 
     function onDocumentSelected(event) {
+        state.report = null;
+        elements.resultsPanel.classList.remove('visible');
         state.documentFile = event.target.files[0] || null;
         elements.documentName.textContent = state.documentFile ? state.documentFile.name : 'Файл не выбран';
         if (state.documentFile && !elements.documentId.value.trim()) {
@@ -659,6 +676,7 @@
         }
 
         elements.runButton.disabled = true;
+        elements.documentInput.disabled = true;
         elements.runButton.textContent = 'Проверка...';
         setStatus('Бэкенд парсит документ и запускает агентов.', 'loading');
         elements.heroStatus.textContent = 'в работе';
@@ -679,6 +697,7 @@
             }
 
             state.report = payload;
+            resetReview();
             state.activeType = 'all';
             state.fixabilityView = 'all';
             state.dismissedIssueIds = new Set();
@@ -692,6 +711,7 @@
             elements.heroStatus.textContent = 'ошибка';
         } finally {
             elements.runButton.disabled = false;
+            elements.documentInput.disabled = false;
             elements.runButton.textContent = 'Запустить проверку';
         }
     }
@@ -751,7 +771,7 @@
 
     function getActiveIssues() {
         if (!state.report) return [];
-        return (state.report.issues || []).filter((issue) => !state.dismissedIssueIds.has(issue.id));
+        return (state.report.issues || []).filter((issue) => !state.dismissedIssueIds.has(issue.id) && !applied.has(issue.id));
     }
 
     function getDismissedIssues() {
@@ -864,6 +884,7 @@
 
     function renderIssues() {
         const issues = getRenderableIssues();
+        renderDocumentReview(issues);
         elements.issuesList.innerHTML = issues.map(renderIssueCard).join('');
         elements.emptyState.hidden = issues.length !== 0;
         elements.emptyState.textContent = state.showDismissed
@@ -916,7 +937,7 @@
 
                 <div class="issue-meta">
                     <span class="issue-meta-label">Норма стандарта</span>
-                    <div class="issue-meta-value"><strong>${escapeHtml(issue.standard_reference?.rule_id || '?')}</strong> ? ${escapeHtml(quote)}</div>
+                    <div class="issue-meta-value">${normLink(issue)}</div>
                 </div>
             </article>
         `;
@@ -934,6 +955,8 @@
     }
 
     function isIssueFixable(issue) {
+        if (supportsReview && state.report?.parsed_document?.meta?.extras?.source_format === 'docx')
+            return canApplyHere(issue);
         return Boolean(issue && issue.suggestion);
     }
 
@@ -987,6 +1010,7 @@
             .replaceAll('"', '&quot;')
             .replaceAll("'", '&#39;');
     }
+    {% include 'review.js' %}
 </script>
 </body>
 </html>
