@@ -77,7 +77,7 @@ class AnalyzeFileApiTests(unittest.TestCase):
 
     def setUp(self) -> None:
         dependencies._pipeline = DocumentPipeline(llm_provider=FakeProvider(), registry=StandardRegistry())
-        self.client = TestClient(app)
+        self.client = TestClient(app,base_url="http://localhost")
 
     def tearDown(self) -> None:
         dependencies._pipeline = None

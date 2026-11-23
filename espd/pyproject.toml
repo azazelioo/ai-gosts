@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-gosts-espd"
+version = "0.3.0"
+requires-python = ">=3.11"
+dependencies = ["pymupdf>=1.26,<2", "Pillow>=10", "tesserocr>=2.9,<3"]
+readme = "README.md"
+
+[tool.setuptools]
+packages = ["espd"]
+package-dir = {espd = "."}
