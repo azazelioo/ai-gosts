@@ -207,4 +207,4 @@ Project Link: [Document Formatter](https://github.com/art-kors/document-formatte
 
 ## Third-party code
 
-This repository includes [Document Formatter](https://github.com/art-kors/document-formatter) by Artemii Korsaev, distributed under the MIT license. See the [original license and copyright notice](third-party/document-formatter/LICENSE).
+This repository includes [Document Formatter](https://github.com/art-kors/document-formatter) by Artemii Korsaev.
