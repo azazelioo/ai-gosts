@@ -33,9 +33,9 @@ class StampOCR:
         self.engine = None
         self.unavailable = False
 
-    def read(self, pixmap):
+    def available(self):
         if self.unavailable:
-            return ""
+            return False
         if self.engine is None:
             try:
                 from tesserocr import PSM, PyTessBaseAPI
@@ -43,7 +43,22 @@ class StampOCR:
                 self.engine = self.stack.enter_context(PyTessBaseAPI(lang="rus", psm=PSM.SPARSE_TEXT, **args))
             except (ImportError, RuntimeError):
                 self.unavailable = True
-                return ""
+                return False
+        return True
+
+    def cell_text(self, image, *, numeric):
+        from tesserocr import PSM
+        self.engine.SetPageSegMode(PSM.SINGLE_LINE)
+        self.engine.SetVariable("tessedit_char_whitelist", "0123456789.," if numeric else "")
+        self.engine.SetImage(image)
+        return self.engine.GetUTF8Text().strip(), self.engine.MeanTextConf()
+
+    def read(self, pixmap):
+        if not self.available():
+            return ""
+        from tesserocr import PSM
+        self.engine.SetPageSegMode(PSM.SPARSE_TEXT)
+        self.engine.SetVariable("tessedit_char_whitelist", "")
         from PIL import Image
         from scipy.ndimage import binary_opening
         ink = np.asarray(pixmap.pil_image().convert("L")) < 180
@@ -57,13 +72,104 @@ class StampOCR:
         return self.engine.GetUTF8Text().strip()
 
 
+def _empty_mass_cell(page, header):
+    """Verify a closed cell below the recognised header, including its visible contents."""
+    scale = 3
+    w, h = header.width, header.height
+    clip = (header + (-w, 0, w, 4*h)) & page.rect
+    pix = page.get_pixmap(clip=clip, matrix=fitz.Matrix(scale, scale),
+                          colorspace=fitz.csGRAY, alpha=False)
+    ink = np.frombuffer(pix.samples_mv, dtype=np.uint8).reshape(pix.height, pix.width) < 235
+    cx = round((header.x0 + w/2)*scale - pix.x)
+    half = max(2, round(w*.3*scale))
+    if cx-half < 0 or cx+half >= pix.width:
+        return None
+    # Horizontal rules must cross the middle of the mass column.
+    rows = np.flatnonzero(ink[:, cx-half:cx+half].all(axis=1))
+    bands = np.split(rows, np.flatnonzero(np.diff(rows) > 1)+1)
+    for upper, lower in zip(bands, bands[1:]):
+        top, bottom = int(upper[-1]), int(lower[0])
+        if not (.55*h < (pix.y+top)/scale-header.y0 < 1.35*h
+                and h < (bottom-top)/scale < 4*h):
+            continue
+        cols = np.flatnonzero(ink[top:bottom+1, :].all(axis=0))
+        lefts, rights = cols[cols < cx-half], cols[cols > cx+half]
+        if not (lefts.size and rights.size):
+            continue
+        left, right = int(lefts[-1]), int(rights[0])
+        if not (.9*w < (right-left)/scale < 2*w):
+            continue
+        cell = ink[top:bottom+1, left:right+1]
+        if not (cell[0].all() and cell[-1].all()) or cell[2:-2, 2:-2].any():
+            continue
+        return [(pix.x+left)/scale, (pix.y+top)/scale,
+                (pix.x+right)/scale, (pix.y+bottom)/scale]
+    return None
+
+
+def read_mass_field(page):
+    fields = _text_mass_fields(page)
+    if len(fields) == 1 and fields[0]["status"] != "unread":
+        return fields[0]
+    return {"status": "unread"}
+
+
+def _text_mass_fields(page):
+    """Use neighbouring title-block headers to isolate the mass column."""
+    words = [(fitz.Rect(w[:4]) * page.rotation_matrix, w[4])
+             for w in page.get_text("words")]
+    headers = [box for box, word in words if word.casefold() == "масса"]
+    fields = [_text_mass_at(page, words, header) for header in headers]
+    return [field for field in fields if field is not None]
+
+
+def _text_mass_at(page, words, h):
+    neighbors = [(box, word.casefold().rstrip(".")) for box, word in words
+                 if abs(box.y0-h.y0) < h.height/2]
+    if not (any(word == "лит" and 0 < h.x0-box.x0 < 2*h.width for box, word in neighbors)
+            and any(word == "масштаб" and 0 < box.x0-h.x0 < 2*h.width for box, word in neighbors)):
+        return None
+    values = [(box, word) for box, word in words
+              if h.y0 + h.height*.45 < box.y0 < h.y0 + h.height*2.4
+              and abs(box.x0+box.x1-h.x0-h.x1) < h.width*.85]
+    if not values:
+        cell = _empty_mass_cell(page, h)
+        if cell:
+            return {"status": "empty", "box_pt": cell, "header_box_pt": list(h)}
+    if len(values) != 1 or not re.fullmatch(r"\d+(?:[.,]\d+)?", values[0][1]):
+        return {"status": "unread", "header_box_pt": list(h)}
+    box, value = values[0]
+    return {"status": "read", "value": value, "box_pt": list(box),
+            "header_box_pt": list(h), "decimal_point": "." in value}
+
+
 def inspect_layout(page, dest, ocr):
     scale = min(1.5, 1100/max(page.rect.width, page.rect.height))
     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csGRAY, alpha=False)
     ink = np.frombuffer(pix.samples_mv, dtype=np.uint8).reshape(pix.height, pix.width) < 218
     frame = bounds(ink)
-    result = {"coordinates": "displayed PDF page, points from top left",
-              "frame": None, "title_block": None}
+    fields = _text_mass_fields(page)
+    if (not fields or any(f["status"] == "unread" for f in fields)) and ocr.available():
+        from .mass_ocr import scan_mass_fields
+        for candidate in scan_mass_fields(page, ocr.cell_text):
+            header = fitz.Rect(candidate["header_box_pt"])
+            matches = [idx for idx, field in enumerate(fields)
+                       if header.intersects(fitz.Rect(field["header_box_pt"]))]
+            if not matches:
+                fields.append(candidate)
+            elif len(matches) == 1 and fields[matches[0]]["status"] == "unread":
+                fields[matches[0]] = candidate
+    fields.sort(key=lambda field: (field["header_box_pt"][1], field["header_box_pt"][0]))
+    for i, field in enumerate(fields, start=1):
+        if field.get("method") == "cell_ocr":
+            suffix = "" if len(fields) == 1 else f"-{i}"
+            crop = f"page-{page.number+1}-mass{suffix}.png"
+            zone = fitz.Rect(field["header_box_pt"]) | fitz.Rect(field["box_pt"])
+            page.get_pixmap(matrix=fitz.Matrix(4, 4), clip=zone).save(dest/crop)
+            field["crop"] = crop
+    result = {"coordinates": "displayed PDF page, points from top left", "mass_fields": fields,
+              "frame": None, "title_block": None,
+              "mass_field": fields[0] if len(fields) == 1 else {"status": "unread"}}
     if not frame:
         return result
     rect = fitz.Rect(*(v/scale for v in frame))

@@ -17,6 +17,7 @@ def apply_fixes_to_source_docx(file_bytes: bytes, document: DocumentInput, issue
     from docx.text.paragraph import Paragraph
 
     source = Document(BytesIO(file_bytes))
+    table_targets = _source_table_targets(source, document)
     fixed = apply_fixes(document, issues)
 
     old_sections = {section.id: section for section in document.sections}
@@ -67,7 +68,7 @@ def apply_fixes_to_source_docx(file_bytes: bytes, document: DocumentInput, issue
     for old_item, new_item in zip(document.tables, fixed.tables):
         _apply_caption_change(source, old_item.caption, new_item.caption, old_item.position.paragraph_index)
 
-    _apply_table_structure_fixes(source, document, issues)
+    _apply_table_structure_fixes(issues, table_targets)
     _apply_formula_fixes(source, document, issues)
     _normalize_where_explanations(source)
 
@@ -120,28 +121,41 @@ def _apply_caption_change(source_doc, old_caption: str, new_caption: str, paragr
     _replace_paragraph_text(paragraph, new_caption)
 
 
-def _apply_table_structure_fixes(source_doc, parsed_document: DocumentInput, issues: List[Issue]) -> None:
-    needs_move = any(issue.subtype == 'table_caption_below_table' for issue in issues)
-    needs_header_cleanup = any(issue.subtype == 'invalid_table_header_punctuation' for issue in issues)
-    needs_header_alignment = any(issue.subtype == 'table_header_alignment' for issue in issues)
-    if not (needs_move or needs_header_cleanup or needs_header_alignment):
-        return
-
+def _source_table_targets(source_doc, parsed_document):
     tables_meta = parsed_document.meta.extras.get('docx_tables_meta', []) if parsed_document.meta and parsed_document.meta.extras else []
+    paragraphs = source_doc.paragraphs
+    source_tables = source_doc.tables
+    targets = {}
+    for meta in tables_meta:
+        table_index = meta.get('table_index')
+        if not isinstance(table_index, int) or not 1 <= table_index <= len(source_tables):
+            continue
+        source_table = source_tables[table_index - 1]
+        index = meta.get('caption_paragraph_index')
+        if not isinstance(index, int) or not 1 <= index <= len(paragraphs):
+            continue
+        caption_paragraph = paragraphs[index - 1]
+        if not re.match(r'^\s*Таблица\s+\S', caption_paragraph.text, re.IGNORECASE):
+            continue
+        # Earlier saved analyses may have counted only nonempty paragraphs.
+        # Verify the physical neighbour again before editing the source.
+        above = meta.get('caption_position') == 'above'
+        if _caption_neighbor(caption_paragraph, 'getnext' if above else 'getprevious') is not source_table._tbl:
+            continue
+        targets[index] = (source_table, caption_paragraph)
+    return targets
+
+
+def _apply_table_structure_fixes(issues, targets) -> None:
     for issue in issues:
         if not issue.location.paragraph_id or not issue.location.paragraph_id.startswith('tbl_'):
             continue
-        try:
-            table_position = int(issue.location.paragraph_id.split('_', 1)[1]) - 1
-        except ValueError:
+        target = targets.get(issue.location.paragraph_index)
+        if target is None:
             continue
-        if table_position < 0 or table_position >= len(tables_meta) or table_position >= len(getattr(source_doc, 'tables', [])):
-            continue
-        meta = tables_meta[table_position]
-        source_table = source_doc.tables[table_position]
+        source_table, caption_paragraph = target
         if issue.subtype == 'table_caption_below_table':
-            caption_paragraph = _find_docx_paragraph_by_index(source_doc, meta.get('caption_paragraph_index'))
-            if caption_paragraph is not None and not _paragraph_contains_drawing(caption_paragraph):
+            if not _paragraph_contains_drawing(caption_paragraph):
                 source_table._tbl.addprevious(caption_paragraph._p)
         elif issue.subtype == 'invalid_table_header_punctuation' and source_table.rows:
             for cell in source_table.rows[0].cells:
@@ -154,6 +168,14 @@ def _apply_table_structure_fixes(source_doc, parsed_document: DocumentInput, iss
             for cell in source_table.rows[0].cells:
                 for paragraph in cell.paragraphs:
                     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+
+def _caption_neighbor(paragraph, direction):
+    from docx.oxml.text.paragraph import CT_P
+    node = getattr(paragraph._p, direction)()
+    while isinstance(node, CT_P) and not node.text.strip() and not node.xpath('.//w:drawing'):
+        node = getattr(node, direction)()
+    return node
 
 
 def _apply_formula_fixes(source_doc, parsed_document: DocumentInput, issues: List[Issue]) -> None:

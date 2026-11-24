@@ -2,6 +2,7 @@ import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from app.parsing.document_to_schema import UNNUMBERED_HEADINGS
 from app.schemas.agent_result import AgentResult
 from app.schemas.document import DocumentInput, FigureItem, Section
 from app.schemas.issue import Issue, IssueLocation, StandardReference
@@ -38,7 +39,7 @@ TITLE_PAGE_CENTER_HINTS = [_u("\u043e\u0442\u0447\u0435\u0442"), _u("\u0442\u043
 TITLE_PAGE_ORG_HINTS = [_u("\u043c\u0438\u043d\u0438\u0441\u0442\u0435\u0440\u0441\u0442\u0432\u043e"), _u("\u0443\u043d\u0438\u0432\u0435\u0440\u0441\u0438\u0442\u0435\u0442"), _u("\u0438\u043d\u0441\u0442\u0438\u0442\u0443\u0442"), _u("\u0430\u043a\u0430\u0434\u0435\u043c\u0438\u044f"), _u("\u043a\u0430\u0444\u0435\u0434\u0440\u0430"), _u("\u0444\u0430\u043a\u0443\u043b\u044c\u0442\u0435\u0442"), _u("\u043a\u043e\u043b\u043b\u0435\u0434\u0436")]
 TITLE_PAGE_DOC_HINTS = [_u("\u043e\u0442\u0447\u0435\u0442"), _u("\u043f\u043e\u044f\u0441\u043d\u0438\u0442\u0435\u043b\u044c\u043d\u0430\u044f \u0437\u0430\u043f\u0438\u0441\u043a\u0430"), _u("\u043a\u0443\u0440\u0441\u043e\u0432\u0430\u044f \u0440\u0430\u0431\u043e\u0442\u0430"), _u("\u0434\u0438\u043f\u043b\u043e\u043c\u043d\u0430\u044f \u0440\u0430\u0431\u043e\u0442\u0430"), _u("\u0432\u044b\u043f\u0443\u0441\u043a\u043d\u0430\u044f \u043a\u0432\u0430\u043b\u0438\u0444\u0438\u043a\u0430\u0446\u0438\u043e\u043d\u043d\u0430\u044f \u0440\u0430\u0431\u043e\u0442\u0430"), _u("\u043b\u0430\u0431\u043e\u0440\u0430\u0442\u043e\u0440\u043d\u0430\u044f \u0440\u0430\u0431\u043e\u0442\u0430"), _u("\u043f\u0440\u043e\u0435\u043a\u0442")]
 TITLE_PAGE_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
-CENTERED_STRUCTURAL_TITLES = {
+CENTERED_STRUCTURAL_TITLES = UNNUMBERED_HEADINGS | {
     _u("\u0441\u043e\u0434\u0435\u0440\u0436\u0430\u043d\u0438\u0435"),
     _u("\u043e\u0433\u043b\u0430\u0432\u043b\u0435\u043d\u0438\u0435"),
     _u("\u0440\u0435\u0444\u0435\u0440\u0430\u0442"),
@@ -160,12 +161,10 @@ def _check_tables(document: DocumentInput, parsed_standard: ParsedStandard, stan
         if item.get('caption_paragraph_index') is not None
     }
 
-    for index, table in enumerate(document.tables, start=1):
+    for table in document.tables:
         caption = normalize_whitespace(table.caption)
         location = IssueLocation(page=table.position.page, paragraph_id=table.id, paragraph_index=table.position.paragraph_index)
         meta = meta_by_caption_index.get(table.position.paragraph_index)
-        if meta is None and index <= len(tables_meta):
-            meta = tables_meta[index - 1]
 
         if not caption:
             issues.append(_build_issue('formatting', 'missing_table_caption', 'warning', _u("У таблицы отсутствует наименование"), f"{TABLE_WORD} {table.id} " + _u("не содержит строку вида '") + f"{TABLE_WORD} N - " + _u("Наименование таблицы'."), location, _build_standard_reference(standard_id, caption_rule), _u("Добавить наименование таблицы")))
@@ -184,7 +183,7 @@ def _check_tables(document: DocumentInput, parsed_standard: ParsedStandard, stan
             if invalid_headers:
                 issues.append(_build_issue('formatting', 'invalid_table_header_punctuation', 'warning', _u("Заголовки столбцов таблицы содержат точки"), _u("В первой строке таблицы обнаружены заголовки с точкой: ") + '; '.join(invalid_headers) + '.', location, _build_standard_reference(standard_id, caption_rule), _u("Убрать точки в заголовках столбцов таблицы")))
 
-            header_paragraphs = [item for item in table_paragraphs if item.get('table_index') == index and item.get('row_index') == 1 and normalize_whitespace(item.get('text', ''))]
+            header_paragraphs = [item for item in table_paragraphs if item.get('table_index') == meta.get('table_index') and item.get('row_index') == 1 and normalize_whitespace(item.get('text', ''))]
             if header_paragraphs and any(item.get('alignment') != 'center' for item in header_paragraphs):
                 issues.append(_build_issue('formatting', 'table_header_alignment', 'info', _u("Заголовки столбцов таблицы должны быть по центру"), _u("В первой строке таблицы обнаружено нецентрованное выравнивание заголовков столбцов."), location, _build_standard_reference(standard_id, caption_rule), _u("Выровнять заголовки столбцов по центру")))
 
@@ -937,7 +936,7 @@ def _check_headings(document: DocumentInput, parsed_standard: ParsedStandard, st
         if is_structural:
             if normalize_whitespace(section.number):
                 issues.append(_build_issue('formatting', 'structural_heading_numbered', 'warning', _u("Структурный элемент не должен иметь номер"), _u("Структурный элемент '") + title + _u("' ошибочно имеет номер '") + normalize_whitespace(section.number) + _u("'."), location, _build_standard_reference(standard_id, heading_rule), _u("Убрать номер у структурного элемента")))
-            if title != title.upper():
+            if title != title.upper() and not payload.get('displayed_uppercase'):
                 issues.append(_build_issue('formatting', 'structural_heading_not_uppercase', 'info', _u("Структурный заголовок должен быть прописным"), _u("Заголовок '") + title + _u("' должен быть написан прописными буквами."), location, _build_standard_reference(standard_id, heading_rule), _u("Привести заголовок к верхнему регистру")))
             if meta:
                 if meta.get('alignment') != 'center':

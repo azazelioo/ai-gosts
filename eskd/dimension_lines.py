@@ -4,6 +4,42 @@ from collections import defaultdict
 import pymupdf as fitz
 
 
+def check_parallel_spacing(items):
+    """Measure the sheet gap between overlapping horizontal or vertical dimension lines."""
+    bands = defaultdict(list)
+    linked = 0
+    for item in items:
+        line = item.get("dimension_line")
+        if not line:
+            continue
+        (x1, y1), (x2, y2) = line["endpoints_pt"]
+        vertical = abs(x2-x1) < abs(y2-y1)
+        along, across = ((y1, y2), (x1, x2)) if vertical else ((x1, x2), (y1, y2))
+        bands[vertical].append((sum(across)/2, min(along), max(along), linked, item))
+        linked += 1
+    findings = []
+    for lines in bands.values():
+        lines.sort()
+        for i, (coordinate, start, end, _, item) in enumerate(lines):
+            for j in range(i-1, -1, -1):
+                prior, low, high, _, other = lines[j]
+                gap_pt = coordinate-prior
+                if gap_pt >= 7*72/25.4:
+                    break
+                # Rounded CAD endpoints: ignore coincident axes and touching projections.
+                if gap_pt <= .3 or min(end, high)-max(start, low) <= .3:
+                    continue
+                findings.append({"status": "review", "gap_mm": round(gap_pt*25.4/72, 3),
+                                 "labels": [other["label"], item["label"]],
+                                 "lines_pt": [other["dimension_line"]["endpoints_pt"],
+                                              item["dimension_line"]["endpoints_pt"]]})
+    return {"standard": "ГОСТ 2.307-2011, п. 5.11", "minimum_mm": 7,
+            "linked_lines": linked, "unlinked_labels": len(items)-linked,
+            "scope": "Параллельные горизонтальные и вертикальные размерные линии с перекрывающимися проекциями",
+            "recommendation": "Сверить обе линии на чертеже. Если привязка подтверждена, разнести их минимум на 7 мм на листе.",
+            "findings": findings}
+
+
 def arrowed_segments(page):
     # Key endpoints at PDF-point resolution to tolerate CAD export rounding.
     wings = defaultdict(set)

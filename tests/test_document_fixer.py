@@ -490,6 +490,23 @@ class DocumentFixerTests(unittest.TestCase):
         self.assertEqual(str(fixed_second_run.font.color.rgb), '000000')
 
 
+    def test_caption_after_blank_paragraph_targets_only_its_table(self):
+        doc = WordDocument()
+        doc.add_table(rows=1, cols=1).cell(0, 0).text = "Служебная."
+        doc.add_paragraph()
+        doc.add_paragraph("Таблица 1 - Данные")
+        doc.add_table(rows=1, cols=1).cell(0, 0).text = "Параметр."
+        stream = BytesIO()
+        doc.save(stream)
+        parsed = parse_docx_to_document(stream.getvalue(), filename="two.docx", standard_id="gost_7_32_2017")
+        issues = self.pipeline.analyze_document(parsed).issues
+        changes = [i for i in issues if i.subtype == 'invalid_table_header_punctuation']
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].location.paragraph_index, 2)
+        self.assertIn("Параметр.", changes[0].evidence)
+        fixed = WordDocument(BytesIO(apply_fixes_to_source_docx(stream.getvalue(), parsed, changes)))
+        self.assertEqual([table.cell(0, 0).text for table in fixed.tables], ["Служебная.", "Параметр"])
+
     def test_apply_fixes_to_source_docx_moves_table_caption_and_cleans_headers_in_appendix(self) -> None:
         from docx.oxml.table import CT_Tbl
         from docx.oxml.text.paragraph import CT_P

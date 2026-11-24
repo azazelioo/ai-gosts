@@ -2,7 +2,7 @@
 import re
 
 import pymupdf as fitz
-from .dimension_lines import link_dimensions
+from .dimension_lines import check_parallel_spacing, link_dimensions
 
 NUM = r"\d+(?:[.,]\d+)?"
 DEV = rf"(?:±|[+-]){NUM}"
@@ -158,4 +158,5 @@ def inspect_dimensions(page, layout, dest, tessdata):
                            outline="#cc6600" if item["status"]=="review" else "#167dc2", width=2)
         result["preview"] = f"page-{page.number+1}-dimensions.png"
         image.save(dest/result["preview"])
+    result["parallel_spacing"] = check_parallel_spacing(annotations)
     return result

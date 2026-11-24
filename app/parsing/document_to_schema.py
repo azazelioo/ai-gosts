@@ -15,7 +15,8 @@ FIGURE_PATTERN = re.compile(
 TABLE_PATTERN = re.compile('^(?:\u0422\u0430\u0431\u043b\u0438\u0446(?:\u0430)?)\s+(?P<number>\d+(?:\.\d+)*)\s*[\u2013-]?\s*(?P<title>.*)$', re.IGNORECASE)
 _HEADING_STYLE_HINTS = ('heading', '\u0437\u0430\u0433\u043e\u043b\u043e\u0432\u043e\u043a')
 
-_CANONICAL_UNNUMBERED_HEADINGS = {
+UNNUMBERED_HEADINGS = {
+    "список исполнителей", "перечень сокращений и обозначений", "термины и определения",
     '\u0432\u0432\u0435\u0434\u0435\u043d\u0438\u0435',
     '\u0437\u0430\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435',
     '\u0441\u043e\u0434\u0435\u0440\u0436\u0430\u043d\u0438\u0435',
@@ -97,6 +98,7 @@ def parse_docx_to_document(
     from docx import Document
 
     doc = Document(BytesIO(file_bytes))
+    _normalize_fractional_twips(doc)
     sections: List[Section] = []
     paragraphs: List[Paragraph] = []
     figures: List[FigureItem] = []
@@ -110,13 +112,11 @@ def parse_docx_to_document(
         if not text:
             continue
 
-        alignment = _alignment_name(paragraph.alignment)
+        alignment = _effective_alignment(paragraph)
         style_name = (getattr(paragraph.style, 'name', '') or '').strip()
         paragraph_meta.append(_build_paragraph_meta_entry(paragraph, index, text, alignment, style_name))
 
-        heading = _parse_heading(text)
-        if heading is None and _looks_like_word_heading(style_name, text):
-            heading = _fallback_heading_from_style(text, len(sections) + 1)
+        heading = _word_heading(style_name, text, len(sections) + 1)
         if heading is not None:
             if current_section is not None:
                 current_section.text = current_section.text.strip()
@@ -127,6 +127,7 @@ def parse_docx_to_document(
                 'text': text,
                 'alignment': alignment,
                 'style_name': style_name,
+                'displayed_uppercase': _heading_displays_uppercase(paragraph),
             }
             continue
 
@@ -239,13 +240,22 @@ def _parse_table(block: str, index: int, paragraph_index: int) -> Optional[Table
     )
 
 
+def _word_heading(style_name, text, sequence):
+    if re.fullmatch(r"(?:toc|оглавление)\s*\d+", style_name, re.I):
+        return None
+    heading = _parse_heading(text)
+    if heading is None and _looks_like_word_heading(style_name, text):
+        return _fallback_heading_from_style(text, sequence)
+    return heading
+
+
 def _looks_like_word_heading(style_name: str, text: str) -> bool:
     normalized_style = style_name.strip().lower()
     if any(hint in normalized_style for hint in _HEADING_STYLE_HINTS):
         return True
 
     normalized_text = ' '.join(text.lower().replace('?', '?').split())
-    if normalized_text in _CANONICAL_UNNUMBERED_HEADINGS:
+    if normalized_text in UNNUMBERED_HEADINGS:
         return True
 
     return False
@@ -323,7 +333,7 @@ def _footer_page_field_meta(footer: Any) -> Dict[str, Any]:
     for paragraph in getattr(footer, 'paragraphs', []) or []:
         if _paragraph_has_page_field(paragraph):
             result['has_page_field'] = True
-            result['alignment'] = _alignment_name(paragraph.alignment)
+            result['alignment'] = _effective_alignment(paragraph)
             return result
     return result
 
@@ -375,6 +385,9 @@ def _extract_docx_tables_meta(doc: Any, sections: List[Section]) -> List[Dict[st
             continue
         previous_paragraph = _nearest_table_caption_block(blocks, position, step=-1)
         next_paragraph = _nearest_table_caption_block(blocks, position, step=1)
+        if position + 2 < len(blocks) and blocks[position + 2]['type'] == 'table':
+            # A caption directly above the following table belongs to that table.
+            next_paragraph = None
         caption_block = previous_paragraph or next_paragraph
         caption_position = 'above' if previous_paragraph else 'below' if next_paragraph else 'missing'
         section_title = block.get('section_title') or ''
@@ -392,15 +405,10 @@ def _extract_docx_tables_meta(doc: Any, sections: List[Section]) -> List[Dict[st
 
 def _nearest_table_caption_block(blocks: List[Dict[str, Any]], position: int, *, step: int) -> Optional[Dict[str, Any]]:
     index = position + step
-    while 0 <= index < len(blocks):
+    if 0 <= index < len(blocks):
         block = blocks[index]
-        if block['type'] == 'table':
-            return None
         if block['type'] == 'paragraph' and TABLE_PATTERN.match(block['text']):
             return block
-        if block['type'] == 'paragraph' and _parse_heading(block['text']) is not None:
-            return None
-        index += step
     return None
 
 
@@ -423,14 +431,12 @@ def _iter_docx_body_blocks(doc: Any):
     for child in parent.iterchildren():
         if isinstance(child, CT_P):
             paragraph = Paragraph(child, doc)
+            paragraph_index += 1
             text = ' '.join(paragraph.text.split())
             if not text:
                 continue
-            paragraph_index += 1
             style_name = (getattr(paragraph.style, 'name', '') or '').strip()
-            heading = _parse_heading(text)
-            if heading is None and _looks_like_word_heading(style_name, text):
-                heading = _fallback_heading_from_style(text, 1)
+            heading = _word_heading(style_name, text, 1)
             if heading is not None:
                 current_section_id = heading['id']
                 current_section_title = heading['title']
@@ -472,7 +478,7 @@ def _extract_table_paragraph_meta(doc: Any) -> List[Dict[str, Any]]:
                         {
                             'paragraph_index': paragraph_index,
                             'text': text,
-                            'alignment': _alignment_name(paragraph.alignment),
+                            'alignment': _effective_alignment(paragraph),
                             'style': (getattr(paragraph.style, 'name', '') or '').strip(),
                             'table_index': table_index,
                             'row_index': row_index,
@@ -494,9 +500,7 @@ def _extract_docx_formula_meta(doc: Any) -> List[Dict[str, Any]]:
         if _starts_with_formula_explanation(text):
             continue
         style_name = (getattr(paragraph.style, 'name', '') or '').strip()
-        heading = _parse_heading(text)
-        if heading is None and _looks_like_word_heading(style_name, text):
-            heading = _fallback_heading_from_style(text, 1)
+        heading = _word_heading(style_name, text, 1)
         if heading is not None:
             current_section_id = heading['id']
             current_section_title = heading['title']
@@ -511,7 +515,7 @@ def _extract_docx_formula_meta(doc: Any) -> List[Dict[str, Any]]:
             {
                 'paragraph_index': index,
                 'text': text,
-                'alignment': _alignment_name(paragraph.alignment),
+                'alignment': _effective_alignment(paragraph),
                 'has_math_xml': has_math_xml,
                 'is_standalone': has_math_xml or _looks_like_formula_standalone(text),
                 'equation_number': _extract_formula_number(text),
@@ -791,12 +795,10 @@ def _effective_run_color_rgb(run: Any, paragraph: Any) -> Optional[str]:
 
 
 def _resolve_style_paragraph_attr(style: Any, attr: str) -> Any:
-    current = style
-    while current is not None:
+    for current in _style_chain(style):
         value = getattr(getattr(current, 'paragraph_format', None), attr, None)
         if value is not None:
             return value
-        current = getattr(current, 'base_style', None)
     return None
 
 
@@ -820,20 +822,76 @@ def _resolve_style_font_color(style: Any) -> Any:
     return None
 
 
-def _alignment_name(value: Any) -> str:
-    if value is None:
-        return 'unspecified'
-    mapping = {
-        0: 'left',
-        1: 'center',
-        2: 'right',
-        3: 'justify',
-        4: 'distribute',
-    }
-    try:
-        return mapping.get(int(value), str(value).lower())
-    except (TypeError, ValueError):
-        return str(value).lower()
+def _normalize_fractional_twips(doc: Any) -> None:
+    """Some exporters write fractional twips where Word expects whole twips."""
+    from docx.oxml.ns import qn
+    from docx.parts.hdrftr import FooterPart, HeaderPart
+    roots = [doc.element, doc.styles.element]
+    roots.extend(part.element for part in doc.part.package.parts if isinstance(part, (HeaderPart, FooterPart)))
+    for root in roots:
+        for tag, attrs in [('ind', ('firstLine', 'hanging', 'left', 'right')),
+                           ('spacing', ('line', 'before', 'after')),
+                           ('pgMar', ('left', 'right', 'top', 'bottom', 'header', 'footer', 'gutter'))]:
+            keys = [qn('w:' + attr) for attr in attrs]
+            for node in root.iter(qn('w:' + tag)):
+                for key in keys:
+                    value = node.get(key)
+                    if value and re.fullmatch(r'-?\d{1,10}\.\d{1,20}', value):
+                        node.set(key, str(round(float(value))))
+
+
+def _style_chain(style: Any):
+    seen = set()
+    while style is not None and style.style_id not in seen:
+        yield style
+        seen.add(style.style_id)
+        style = style.base_style
+
+
+def _heading_displays_uppercase(paragraph: Any) -> bool:
+    # Caps in a style toggles the inherited value. Direct formatting overrides it.
+    runs = paragraph.runs
+    if ''.join(r.text for r in runs) != paragraph.text:
+        return False
+    for run in runs:
+        if run.text == run.text.upper():
+            continue
+        caps = run.font.all_caps
+        if caps is None:
+            caps = False
+            for style in (paragraph.style, run.style):
+                for ancestor in _style_chain(style):
+                    if ancestor.font.all_caps:
+                        caps = not caps
+        if not caps:
+            return False
+    return bool(runs)
+
+
+def _effective_alignment(paragraph: Any) -> str:
+    from docx.oxml.ns import qn
+    from docx.oxml.ns import nsmap
+
+    def properties():
+        yield paragraph._p.pPr
+        for style in _style_chain(paragraph.style):
+            yield style.element.pPr
+        styles = paragraph.part.package.main_document_part.styles.element
+        yield styles.find('w:docDefaults/w:pPrDefault/w:pPr', namespaces=nsmap)
+
+    def setting(name):
+        for ppr in properties():
+            if ppr is not None:
+                node = ppr.find(qn('w:' + name))
+                if node is not None:
+                    return node.get(qn('w:val'), 'true')
+        return None
+
+    jc = setting('jc')
+    if jc in {'start', 'end'}:
+        rtl = setting('bidi') in {'true', '1', 'on'}
+        return 'right' if (jc == 'end') != rtl else 'left'
+    return {'both': 'justify', None: 'unspecified'}.get(jc, jc)
 
 
 def _build_document_id(filename: str) -> str:

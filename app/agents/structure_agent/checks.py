@@ -1,6 +1,7 @@
 ﻿from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Tuple
 
+from app.parsing.document_to_schema import UNNUMBERED_HEADINGS
 from app.schemas.document import DocumentInput
 from app.schemas.issue import Issue, IssueLocation, StandardReference
 
@@ -202,7 +203,7 @@ def _check_missing_numbers(entries: List[StructureEntry]) -> List[dict]:
 
     for entry in entries:
         normalized_title = _normalize_title(entry.title)
-        if entry.level != 1 or entry.number_parts or normalized_title.startswith("приложение"):
+        if entry.level != 1 or entry.number_parts or normalized_title in UNNUMBERED_HEADINGS or normalized_title.startswith("приложение"):
             continue
         issues.append({
             "subtype": "numbering_error",

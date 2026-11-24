@@ -39,6 +39,42 @@ def _add_page_field(paragraph) -> None:
 
 
 class DocumentToSchemaTests(unittest.TestCase):
+    def test_exported_layout_and_visible_heading_case(self):
+        doc = Document()
+        style = doc.styles["Heading 1"]
+        style.font.all_caps = True
+        heading = doc.add_paragraph("Введение", style=style)
+        ppr = heading._p.get_or_add_pPr()
+        ppr.get_or_add_jc().set(qn("w:val"), "start")
+        ppr.append(OxmlElement("w:bidi"))
+        ppr.get_or_add_ind().set(qn("w:firstLine"), "708.66")
+        mixed = doc.add_paragraph("За", style=style)
+        mixed.add_run("ключение").font.all_caps = False
+        raw = BytesIO()
+        doc.save(raw)
+        parsed = parse_docx_to_document(raw.getvalue(), filename="case.docx", standard_id="gost_7_32_2017")
+        meta = parsed.meta.extras
+        self.assertEqual(meta["docx_paragraphs"][0]["alignment"], "right")
+        self.assertAlmostEqual(meta["docx_paragraphs"][0]["first_line_indent_mm"], 12.5, places=1)
+        self.assertEqual([item["displayed_uppercase"] for item in meta["section_headings"].values()],
+                         [True, False])
+
+    def test_nested_style_alignment_and_direct_override(self):
+        from docx.enum.style import WD_STYLE_TYPE
+        doc = Document()
+        base = doc.styles.add_style("Centered base", WD_STYLE_TYPE.PARAGRAPH)
+        base.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        child = doc.styles.add_style("Derived", WD_STYLE_TYPE.PARAGRAPH)
+        child.base_style = base
+        doc.add_paragraph("Inherited", style=child)
+        doc.add_paragraph("Override", style=child).alignment = WD_ALIGN_PARAGRAPH.LEFT
+        raw = BytesIO()
+        doc.save(raw)
+        parsed = parse_docx_to_document(raw.getvalue(), filename="styles.docx",
+                                        standard_id="gost_7_32_2017")
+        rows = parsed.meta.extras["docx_paragraphs"]
+        self.assertEqual([r["alignment"] for r in rows], ["center", "left"])
+
     def test_parse_text_to_document_extracts_sections_paragraphs_and_captions(self) -> None:
         text = (
             "1 \u0412\u0432\u0435\u0434\u0435\u043d\u0438\u0435\n\n"
